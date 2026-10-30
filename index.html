@@ -7593,6 +7593,9 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     let currentProfileId = 1;
+    // Painéis globais: conteúdo visível em todos os semestres (não filtrado por período)
+    const GLOBAL_STORES = ['financeiro', 'biblioteca', 'links'];
+    window.GLOBAL_STORES = GLOBAL_STORES;
     async function getCurrentProfileId() {
         const profiles = await getAllData('profiles');
         if (!profiles.length) {
@@ -7629,9 +7632,9 @@ document.addEventListener('DOMContentLoaded', function() {
         const [disciplinas, horarios, trabalhos, provas, eventos, financeiro, biblioteca, filmes, notas, links, certificados] = await Promise.all([
             getAllData('disciplinas', 'profileId', pid), getAllData('horarios', 'profileId', pid),
             getAllData('trabalhos', 'profileId', pid), getAllData('provas', 'profileId', pid),
-            getAllData('eventos', 'profileId', pid), getAllData('financeiro', 'profileId', pid),
-            getAllData('biblioteca', 'profileId', pid), getAllData('filmes', 'profileId', pid),
-            getAllData('notas', 'profileId', pid), getAllData('links', 'profileId', pid),
+            getAllData('eventos', 'profileId', pid), getAllData('financeiro'),
+            getAllData('biblioteca'), getAllData('filmes', 'profileId', pid),
+            getAllData('notas', 'profileId', pid), getAllData('links'),
             getAllData('certificados', 'profileId', pid)
         ]);
         // Migração de anexos antigos (único) para array em trabalhos
@@ -13033,7 +13036,7 @@ Atenciosamente,`;
         }
 
         // Count records per semester
-        const STORES_COUNT = ['disciplinas','horarios','trabalhos','provas','eventos','financeiro','biblioteca','filmes','notas','links','certificados','leituras'];
+        const STORES_COUNT = ['disciplinas','horarios','trabalhos','provas','eventos','filmes','notas','certificados','leituras'];
         let html = '<div class="d-flex flex-column gap-2">';
         for (const p of profiles) {
             let total = 0;
@@ -13090,7 +13093,7 @@ Atenciosamente,`;
         wrap.querySelectorAll('.sem-backup-clear').forEach(b => b.addEventListener('click', async e => {
             const id = +e.currentTarget.dataset.id;
             const name = e.currentTarget.dataset.name;
-            if (confirm(`Arquivar "${name}"?\n\nIsso irá:\n1. Exportar o backup completo do semestre\n2. Apagar TODOS os dados deste semestre do sistema\n\nEsta ação não pode ser desfeita. Deseja continuar?`)) {
+            if (confirm(`Arquivar "${name}"?\n\nIsso irá:\n1. Exportar o backup completo do semestre\n2. Apagar TODOS os dados deste semestre do sistema\n(Financeiro, Biblioteca e Links são globais e serão mantidos)\n\nEsta ação não pode ser desfeita. Deseja continuar?`)) {
                 await exportSemesterBackup(id, name, true, true);
             }
         }));
@@ -13099,7 +13102,7 @@ Atenciosamente,`;
             const id = +e.currentTarget.dataset.id;
             const profList = await getAllData('profiles');
             if (profList.length === 1) return;
-            if (confirm('Excluir este semestre? Todos os dados serão perdidos PERMANENTEMENTE.')) {
+            if (confirm('Excluir este semestre? Todos os dados deste semestre serão perdidos PERMANENTEMENTE.\n\n(Financeiro, Biblioteca e Links são globais e serão mantidos.)')) {
                 await deleteSemester(id);
                 await renderSemesterManagementList();
             }
@@ -13107,7 +13110,8 @@ Atenciosamente,`;
     }
 
     async function deleteSemester(id) {
-        const stores = ['disciplinas','horarios','trabalhos','provas','eventos','financeiro','biblioteca','filmes','notas','links','certificados'];
+        // Financeiro, Biblioteca e Links são globais e NÃO são apagados ao excluir/arquivar um semestre
+        const stores = ['disciplinas','horarios','trabalhos','provas','eventos','filmes','notas','certificados'];
         for (const s of stores) {
             const items = await getAllData(s, 'profileId', id);
             for (const i of items) await deleteData(s, i.id);
@@ -13146,6 +13150,8 @@ Atenciosamente,`;
             let recs = await app.readAllFromStore(s);
             if (s === 'profiles') {
                 recs = recs.filter(r => r.id === semId);
+            } else if (GLOBAL_STORES.includes(s)) {
+                // globais: inclui tudo
             } else {
                 recs = recs.filter(r => r.profileId === semId || r.profileId === undefined);
             }
@@ -18413,7 +18419,7 @@ ${diasHtml}
           if (prof !== 'all') {
             if (storeName === 'profiles')
               recs = recs.filter(function(r) { return r.id === parseInt(prof); });
-            else
+            else if ((window.GLOBAL_STORES || ['financeiro','biblioteca','links']).indexOf(storeName) === -1)
               recs = recs.filter(function(r) { return r.profileId === parseInt(prof) || r.profileId === undefined; });
           }
 
