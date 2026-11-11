@@ -1,0 +1,1 @@
+function (k, v) { _lsSet(k, v); if (!applying && !isBlockedLS(k)) markDirty('__ls__'); }
