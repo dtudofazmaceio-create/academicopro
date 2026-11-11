@@ -23008,141 +23008,698 @@ IMPORTANTE: Só inclua URLs reais que você encontrou na pesquisa. Não invente 
 
 
 <!-- ============================================================
-     Acadêmico Pro — Sincronização automática na nuvem (Firebase)
-     Sincroniza todas as stores do IndexedDB (academicoProDB) + as
-     configurações leves do localStorage entre dispositivos usando
-     Cloud Firestore + Firebase Authentication (e-mail/senha).
-     Cada dispositivo que entrar com a MESMA conta passa a compartilhar
-     os dados. Arquivos grandes (PDFs, imagens, documentos) são
-     divididos automaticamente em partes para respeitar o limite de
-     1 MB por documento do Firestore.
-     Usa a API window._acadApp (conexão única já aberta — sem 2ª conexão ao IDB).
+     Acadêmico Pro — Sincronização entre aparelhos (v4, incremental)
+     ------------------------------------------------------------
+     Serviços suportados:
+       • GitHub (repositório PRIVADO) — recomendado. Grátis, aguenta
+         centenas de MB, guarda histórico de versões e tem controle de
+         concorrência (dois aparelhos nunca se sobrescrevem às cegas).
+       • Firebase (Cloud Firestore) — mantido, com o mesmo motor novo.
 
-     CORREÇÃO IMPORTANTE: ao restaurar um backup, o app grava a flag
-     '__sync_restore_pending'. No próximo boot, em vez de BAIXAR da nuvem
-     (que sobrescrevia os dados importados), o sync ENVIA os dados
-     restaurados para a nuvem — a restauração passa a "vencer".
+     Como funciona:
+       • Cada registro do IndexedDB (e cada configuração leve do
+         localStorage) vira um "objeto" endereçado pelo seu hash (SHA-1
+         no formato git). Um manifesto lista chave → hash.
+       • Só objetos NOVOS são enviados e só objetos que faltam são
+         baixados — nada de reenviar 200 MB a cada alteração.
+       • Mesclagem por registro (3 vias: base / local / nuvem): edições
+         em aparelhos diferentes em registros diferentes nunca se perdem.
+         Se o MESMO registro foi alterado nos dois, vence o último a
+         sincronizar. Exclusões também são propagadas.
+       • Restaurar um backup (flag '__sync_restore_pending') faz este
+         aparelho "vencer": os dados restaurados substituem a nuvem.
+     Usa a API window._acadApp (conexão única já aberta ao IDB).
 ============================================================ -->
 <script>
 (function () {
   'use strict';
 
-  const DB_NAME    = 'academicoProDB';
-  const SDK_VER    = '10.12.2';
-  const PUSH_DELAY = 900;
-  const CHUNK_B64  = 700 * 1024;          // tamanho de cada parte (base64) — bem abaixo do limite de 1 MB/doc do Firestore
-  const LIGHT_LS_LIMIT = 200 * 1024;      // valores enormes do localStorage (ex.: imagem de fundo) ficam locais
-  const BATCH_OPS  = 450;                 // operações por batch do Firestore (limite real é 500)
+  const DB_NAME        = 'academicoProDB';
+  const FB_SDK_VER     = '10.12.2';
+  const PUSH_DELAY     = 1500;              // espera após a última alteração antes de enviar
+  const POLL_MS        = 60000;             // verificação leve de novidades na nuvem
+  const LIGHT_LS_LIMIT = 200 * 1024;        // valores enormes do localStorage ficam locais
+  const FB_CHUNK_B64   = 700 * 1024;        // Firestore: tamanho de cada parte (limite 1 MB/doc)
+  const FB_BATCH_BYTES = 6 * 1024 * 1024;   // Firestore: limite de 10 MB por commit — margem
+  const FB_BATCH_OPS   = 400;
+  const GH_INLINE_MAX  = 2 * 1024 * 1024;   // GitHub: objetos até 2 MB vão embutidos na árvore
+  const GH_TREE_BYTES  = 8 * 1024 * 1024;   // GitHub: conteúdo embutido por chamada de árvore
+  const GH_TREE_ITEMS  = 800;
+  const GH_GQL_MAX     = 256 * 1024;        // GitHub: objetos pequenos baixados via GraphQL em lote
+  const GH_GQL_BATCH   = 60;
+  const GH_GQL_BYTES   = 3 * 1024 * 1024;
 
-  // Chaves de localStorage que NÃO devem ser sincronizadas (login/sessão/config interna do próprio sync)
   function isBlockedLS(k) { return !k || k.indexOf('acpro_') === 0 || k.indexOf('__sync_') === 0; }
 
-  let applying = false, booted = false;
-  let enabled = false, DEVICE = null;
+  /* ================== Estado ================== */
+  let PROVIDER = null;        // 'github' | 'firebase' | null
+  let GHCFG = null;           // { owner, repo, branch, token }
   let FBCONFIG = null, EMAIL = null;
-  let fbApp = null, fbAuth = null, fbDb = null, fbUser = null, fbReady = false, fbLoading = false;
-  let lastPulledAt = null, lastPushedAt = null;
-  let dirty = false, busy = false, pendingPush = false, pushTimer = null;
-  let lastError = '';
-  let statusText = 'Não configurado';
+  let enabled = false, DEVICE = null, booted = false, applying = false;
+  let busy = false, pendingSync = false, pendingMode = null, pushTimer = null;
+  let dirty = false, lastError = '', statusText = 'Não configurado', progressText = '';
+  let lastSyncAt = null, P = null;
+  const dirtyStores = new Set();
+  let idxCache = null;        // { storeName: { key: [sha, size] } } — índice local por store
 
-  /* ---------- Detecção de alterações: intercepta escritas no IndexedDB ---------- */
+  /* ================== Detecção de alterações ================== */
+  function storeNameOf(obj) {
+    try {
+      if (obj instanceof IDBObjectStore) return obj.name;
+      if (obj instanceof IDBCursor) {
+        const src = obj.source;
+        if (src instanceof IDBObjectStore) return src.name;
+        if (src && src.objectStore) return src.objectStore.name;
+      }
+    } catch (e) {}
+    return null;
+  }
   function hookIDB(proto, method) {
-    if (!proto || !proto[method] || proto['__sync_wrapped_' + method]) return;
+    if (!proto || !proto[method] || proto['__sync4_wrapped_' + method]) return;
     const orig = proto[method];
     proto[method] = function () {
       try {
-        const tx = this.transaction || (this.source && this.source.transaction);
-        if (!applying && tx && tx.db && tx.db.name === DB_NAME) markDirty();
+        const st = storeNameOf(this);
+        const os = this instanceof IDBObjectStore ? this : (this.source && (this.source.objectStore || this.source));
+        const tx = os && os.transaction;
+        if (!applying && tx && tx.db && tx.db.name === DB_NAME) markDirty(st);
       } catch (e) {}
       return orig.apply(this, arguments);
     };
-    proto['__sync_wrapped_' + method] = true;
+    proto['__sync4_wrapped_' + method] = true;
   }
   try {
-    hookIDB(window.IDBObjectStore && IDBObjectStore.prototype, 'put');
-    hookIDB(window.IDBObjectStore && IDBObjectStore.prototype, 'add');
-    hookIDB(window.IDBObjectStore && IDBObjectStore.prototype, 'delete');
-    hookIDB(window.IDBObjectStore && IDBObjectStore.prototype, 'clear');
-    hookIDB(window.IDBCursor && IDBCursor.prototype, 'update');
-    hookIDB(window.IDBCursor && IDBCursor.prototype, 'delete');
+    ['put', 'add', 'delete', 'clear'].forEach(m => hookIDB(window.IDBObjectStore && IDBObjectStore.prototype, m));
+    ['update', 'delete'].forEach(m => hookIDB(window.IDBCursor && IDBCursor.prototype, m));
   } catch (e) {}
 
-  // Configurações em localStorage também disparam sincronização
   const _lsSet = localStorage.setItem.bind(localStorage);
   const _lsRemove = localStorage.removeItem.bind(localStorage);
-  localStorage.setItem = function (k, v) { _lsSet(k, v); if (!applying && !isBlockedLS(k)) markDirty(); };
-  localStorage.removeItem = function (k) { _lsRemove(k); if (!applying && !isBlockedLS(k)) markDirty(); };
+  localStorage.setItem = function (k, v) { _lsSet(k, v); if (!applying && !isBlockedLS(k)) markDirty('__ls__'); };
+  localStorage.removeItem = function (k) { _lsRemove(k); if (!applying && !isBlockedLS(k)) markDirty('__ls__'); };
 
-  /* ---------- Acesso ao IndexedDB pela API do app ---------- */
+  /* ================== IndexedDB (via app) ================== */
   function acad() { return window._acadApp || null; }
-  function dbReady() { try { const a = acad(); return !!(a && a.getDb && a.getDb() && a.getDb().objectStoreNames && a.getDb().objectStoreNames.length); } catch (e) { return false; } }
+  function db() { try { return acad().getDb(); } catch (e) { return null; } }
+  function dbReady() { const d = db(); return !!(d && d.objectStoreNames && d.objectStoreNames.length); }
   function loginDone() { const ls = document.getElementById('loginScreen'); return !ls || ls.style.display === 'none' || getComputedStyle(ls).display === 'none'; }
-  function storeNames() { try { return Array.from(acad().getDb().objectStoreNames); } catch (e) { return []; } }
-
-  /* ---------- Utilidades: bytes / base64 ---------- */
-  function strToBytes(s) { return new TextEncoder().encode(s); }
-  function bytesToStr(b) { return new TextDecoder().decode(b); }
-  function bytesToB64(bytes) {
-    let bin = ''; const chunk = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-    return btoa(bin);
+  function storeNames() { try { return Array.from(db().objectStoreNames); } catch (e) { return []; } }
+  function getRecord(store, id) {
+    return new Promise((res) => {
+      try {
+        const tx = db().transaction([store], 'readonly');
+        const rq = tx.objectStore(store).get(id);
+        rq.onsuccess = () => res(rq.result); rq.onerror = () => res(undefined);
+      } catch (e) { res(undefined); }
+    });
   }
-  function b64ToBytes(b64) {
-    const bin = atob((b64 || '').replace(/\s/g, '')); const len = bin.length;
-    const out = new Uint8Array(len); for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i); return out;
-  }
-  // Serializa registros -> base64 -> partes seguras para o Firestore (ASCII, sem surrogates)
-  function recsToChunks(recs) {
-    const b64 = bytesToB64(strToBytes(JSON.stringify(recs || [])));
-    const parts = [];
-    for (let off = 0; off < b64.length; off += CHUNK_B64) parts.push(b64.slice(off, off + CHUNK_B64));
-    if (parts.length === 0) parts.push(bytesToB64(strToBytes('[]')));
-    return parts;
-  }
-  function chunksToRecs(parts) {
-    try { const arr = JSON.parse(bytesToStr(b64ToBytes((parts || []).join('')))); return Array.isArray(arr) ? arr : (arr || []); }
-    catch (e) { return []; }
+  function putOne(store, rec) {
+    return new Promise((res) => {
+      try {
+        const tx = db().transaction([store], 'readwrite');
+        const rq = tx.objectStore(store).put(rec);
+        let key = null; rq.onsuccess = () => { key = rq.result; };
+        tx.oncomplete = () => res(key); tx.onerror = tx.onabort = () => res(null);
+      } catch (e) { res(null); }
+    });
   }
 
-  /* ---------- Montagem dos dados locais ---------- */
-  async function collectStores() {
-    const a = acad(); const out = {};
-    for (const s of storeNames()) {
-      let recs = []; try { recs = await a.readAllFromStore(s); } catch (e) { recs = []; }
-      out[s] = recs || [];
+  /* ================== Bytes / hash ================== */
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  function hex(buf) { const b = new Uint8Array(buf); let s = ''; for (let i = 0; i < b.length; i++) s += (b[i] < 16 ? '0' : '') + b[i].toString(16); return s; }
+  async function gitSha(bytes) {
+    const head = enc.encode('blob ' + bytes.length + '\0');
+    const all = new Uint8Array(head.length + bytes.length); all.set(head, 0); all.set(bytes, head.length);
+    return hex(await crypto.subtle.digest('SHA-1', all));
+  }
+  function bytesToB64(bytes) { let bin = ''; const c = 0x8000; for (let i = 0; i < bytes.length; i += c) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + c)); return btoa(bin); }
+  function b64ToBytes(b64) { const bin = atob(b64 || ''); const out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
+  function b64Len(size) { return 4 * Math.ceil(size / 3); }
+  function fmtMB(n) { return (n / 1048576).toFixed(n > 10485760 ? 0 : 1) + ' MB'; }
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  /* ================== Chaves ================== */
+  // 'st/<store>/n123' (id numérico) | 'st/<store>/s<texto>' | 'ls/<chave>'
+  function recKey(store, id) { return 'st/' + store + '/' + (typeof id === 'number' ? 'n' + id : 's' + String(id)); }
+  function parseKey(k) {
+    if (k.indexOf('ls/') === 0) return { kind: 'ls', name: k.slice(3) };
+    const rest = k.slice(3), slash = rest.indexOf('/');
+    const store = rest.slice(0, slash), raw = rest.slice(slash + 1);
+    return { kind: 'st', store: store, id: raw[0] === 'n' ? Number(raw.slice(1)) : raw.slice(1) };
+  }
+
+  /* ================== Índice local ================== */
+  async function indexStore(name) {
+    const out = {};
+    if (name === '__ls__') {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i); if (isBlockedLS(k)) continue;
+        const v = localStorage.getItem(k);
+        if (v == null || v.length > LIGHT_LS_LIMIT) continue;
+        const b = enc.encode(v); out['ls/' + k] = [await gitSha(b), b.length];
+      }
+      return out;
+    }
+    let recs = [];
+    try { recs = await acad().readAllFromStore(name); } catch (e) { recs = []; }
+    for (const r of recs || []) {
+      if (!r || r.id === undefined || r.id === null) continue;
+      const b = enc.encode(JSON.stringify(r));
+      out[recKey(name, r.id)] = [await gitSha(b), b.length];
     }
     return out;
   }
-  function collectLS() {
-    const ls = {};
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i); if (isBlockedLS(k)) continue;
-      const val = localStorage.getItem(k);
-      if (val != null && val.length <= LIGHT_LS_LIMIT) ls[k] = val;   // ignora valores enormes (ex.: imagem de fundo)
+  async function localIndex(full) {
+    if (!idxCache || full) { idxCache = {}; dirtyStores.clear(); for (const s of storeNames().concat(['__ls__'])) idxCache[s] = await indexStore(s); }
+    else {
+      const todo = Array.from(dirtyStores); dirtyStores.clear();
+      for (const s of todo) idxCache[s] = await indexStore(s);
     }
-    return ls;
+    const all = {};
+    for (const s in idxCache) Object.assign(all, idxCache[s]);
+    return all;
+  }
+  // Conteúdo atual (string) de uma chave local, para envio
+  async function localContent(key) {
+    const p = parseKey(key);
+    if (p.kind === 'ls') { const v = localStorage.getItem(p.name); return v == null ? null : v; }
+    const r = await getRecord(p.store, p.id);
+    return r === undefined ? null : JSON.stringify(r);
   }
 
-  // Aplica os dados baixados da nuvem ao IndexedDB + localStorage (sem disparar push)
-  async function applyData(stores, ls) {
-    applying = true;
+  /* ================== Config persistida ================== */
+  function cfgGet(k) { try { return localStorage.getItem('__sync_' + k); } catch (e) { return null; } }
+  function cfgSet(k, v) { try { _lsSet('__sync_' + k, v); } catch (e) {} }
+  function cfgDel(k) { try { _lsRemove('__sync_' + k); } catch (e) {} }
+  function loadCfg() {
+    try { GHCFG = JSON.parse(cfgGet('gh') || 'null'); } catch (e) { GHCFG = null; }
+    try { FBCONFIG = JSON.parse(cfgGet('fbconfig') || 'null'); } catch (e) { FBCONFIG = null; }
+    EMAIL = cfgGet('email');
+    PROVIDER = cfgGet('provider') || (FBCONFIG ? 'firebase' : null);   // migra configuração antiga do Firebase
+    enabled = cfgGet('enabled') === '1' && ((PROVIDER === 'github' && !!GHCFG) || (PROVIDER === 'firebase' && !!FBCONFIG));
+    lastSyncAt = cfgGet('lastSyncAt');
+    DEVICE = cfgGet('device');
+    if (!DEVICE) { DEVICE = 'dev_' + Math.random().toString(36).slice(2) + Date.now().toString(36); cfgSet('device', DEVICE); }
+  }
+  // Base = estado da nuvem na última sincronização bem-sucedida DESTE aparelho (para mesclar em 3 vias)
+  function baseKey() { return 'base_' + (PROVIDER || 'x'); }
+  function loadBase() { try { return JSON.parse(cfgGet(baseKey()) || 'null'); } catch (e) { return null; } }
+  function saveBase(b) { try { cfgSet(baseKey(), JSON.stringify(b)); } catch (e) { console.warn('[sync] base não salva', e); } }
+
+  /* ================== Toast / status ================== */
+  function toast(msg, type) {
     try {
-      const a = acad(); const existing = storeNames();
-      for (const s of Object.keys(stores)) {
-        if (existing.indexOf(s) < 0) continue;
-        try { await a.clearStore(s); } catch (e) {}
-        const recs = stores[s] || [];
-        if (recs.length) { try { await a.putRecordsBatch(s, recs); } catch (e) {} }
+      let host = document.getElementById('__sync_toast');
+      if (!host) { host = document.createElement('div'); host.id = '__sync_toast'; host.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:99999;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none;'; document.body.appendChild(host); }
+      const el = document.createElement('div');
+      const bg = type === 'error' ? '#e74c3c' : (type === 'success' ? '#1abc9c' : '#34495e');
+      el.style.cssText = 'background:' + bg + ';color:#fff;padding:10px 16px;border-radius:10px;font:600 13px system-ui;box-shadow:0 8px 24px rgba(0,0,0,.25);max-width:88vw;text-align:center;';
+      el.textContent = msg; host.appendChild(el);
+      setTimeout(() => { el.style.transition = 'opacity .4s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 400); }, type === 'error' ? 6000 : 3000);
+    } catch (e) {}
+  }
+  function setStatus(s) { statusText = s; const e = document.getElementById('sync-status'); if (e) e.textContent = s; }
+  function setProgress(s) { progressText = s || ''; const e = document.getElementById('sync-progress'); if (e) e.textContent = progressText; }
+
+  /* ================== Pool de concorrência ================== */
+  async function pool(items, n, fn) {
+    let i = 0; const workers = [];
+    for (let w = 0; w < Math.min(n, items.length); w++) workers.push((async () => { while (i < items.length) { const k = i++; await fn(items[k], k); } })());
+    await Promise.all(workers);
+  }
+  function conflictError() { const e = new Error('A nuvem mudou durante o envio'); e.conflict = true; return e; }
+
+  /* =====================================================================
+     PROVEDOR: GitHub (repositório privado)
+     objects/<aa>/<sha>  → conteúdo de cada registro
+     manifest.json       → { v, updatedAt, device, idx: { chave: [sha, bytes] } }
+     ===================================================================== */
+  function GitHubProvider(cfg) {
+    const API = 'https://api.github.com';
+    const R = '/repos/' + encodeURIComponent(cfg.owner) + '/' + encodeURIComponent(cfg.repo);
+    const objPath = (sha) => 'objects/' + sha.slice(0, 2) + '/' + sha;
+
+    function ghMsg(status, msg) {
+      if (status === 401) return 'Token do GitHub inválido ou expirado. Gere um novo token.';
+      if (status === 403 && /rate limit/i.test(msg || '')) return 'Limite de requisições do GitHub atingido. Tente novamente em alguns minutos.';
+      if (status === 403) return 'O token não tem permissão de escrita neste repositório (Contents: Read and write).';
+      if (status === 404) return 'Repositório não encontrado ou o token não tem acesso a ele.';
+      return 'GitHub ' + status + (msg ? ': ' + msg : '');
+    }
+    async function req(method, path, body, accept, tries) {
+      tries = tries || 0;
+      let r;
+      try {
+        r = await fetch(API + path, {
+          method: method, cache: 'no-store',
+          headers: Object.assign({ 'Authorization': 'Bearer ' + cfg.token, 'Accept': accept || 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' }, body ? { 'Content-Type': 'application/json' } : {}),
+          body: body ? JSON.stringify(body) : undefined
+        });
+      } catch (e) {
+        if (tries < 3) { await sleep(1500 * (tries + 1)); return req(method, path, body, accept, tries + 1); }
+        const err = new Error('Sem conexão com o GitHub (verifique a internet).'); err.network = true; throw err;
       }
-      if (ls) {
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i); if (isBlockedLS(k)) continue;
-          if (!(k in ls)) { const v = localStorage.getItem(k); if (v != null && v.length <= LIGHT_LS_LIMIT) _lsRemove(k); }
+      if (!r.ok) {
+        let msg = ''; try { msg = (await r.json()).message || ''; } catch (e) {}
+        // limites secundários / erros transitórios → espera e tenta de novo
+        const retryAfter = Number(r.headers.get('retry-after') || 0);
+        if ((r.status === 429 || (r.status === 403 && /secondary|abuse|rate/i.test(msg)) || r.status >= 500) && tries < 4) {
+          await sleep(Math.min(60000, (retryAfter || (5 * (tries + 1))) * 1000)); return req(method, path, body, accept, tries + 1);
         }
-        for (const k in ls) { if (isBlockedLS(k)) continue; try { _lsSet(k, ls[k]); } catch (e) {} }
+        const e = new Error(ghMsg(r.status, msg)); e.status = r.status; e.ghMessage = msg; throw e;
       }
+      if (r.status === 204) return null;
+      if (accept && accept.indexOf('raw') >= 0) return r.text();
+      return r.json();
+    }
+
+    async function initEmptyRepo() {
+      await req('PUT', R + '/contents/README.md', {
+        message: 'Acadêmico Pro: inicializa repositório de sincronização',
+        content: bytesToB64(enc.encode('# Acadêmico Pro — dados sincronizados\n\nRepositório usado pelo app para sincronizar os dados entre aparelhos. Não edite manualmente.\n')),
+        branch: cfg.branch
+      });
+    }
+
+    return {
+      name: 'github',
+      label: cfg.owner + '/' + cfg.repo,
+      async check() {
+        const info = await req('GET', R);
+        if (info.permissions && info.permissions.push === false) throw new Error('O token só tem leitura neste repositório. Dê a permissão "Contents: Read and write".');
+        return info;
+      },
+      async getRev() {
+        try { const ref = await req('GET', R + '/git/ref/heads/' + encodeURIComponent(cfg.branch)); return ref.object.sha; }
+        catch (e) { if (e.status === 409 || e.status === 404) return null; throw e; }
+      },
+      async getHead() {
+        let ref;
+        try { ref = await req('GET', R + '/git/ref/heads/' + encodeURIComponent(cfg.branch)); }
+        catch (e) {
+          if (e.status === 409) { await initEmptyRepo(); ref = await req('GET', R + '/git/ref/heads/' + encodeURIComponent(cfg.branch)); }
+          else if (e.status === 404) { await req('GET', R); return { rev: null, tree: null, manifest: null }; }  // ramo ainda não existe
+          else throw e;
+        }
+        const rev = ref.object.sha;
+        const commit = await req('GET', R + '/git/commits/' + rev);
+        let manifest = null;
+        try {
+          const txt = await req('GET', R + '/contents/manifest.json?ref=' + rev, null, 'application/vnd.github.raw+json');
+          manifest = JSON.parse(txt);
+        } catch (e) { if (e.status !== 404) throw e; }
+        return { rev: rev, tree: commit.tree.sha, manifest: manifest };
+      },
+      // items: [{ sha, size }] → Map(sha → string)
+      async getObjects(items, onProgress) {
+        const out = new Map(); let doneBytes = 0;
+        const total = items.reduce((a, b) => a + b.size, 0);
+        const small = items.filter(x => x.size <= GH_GQL_MAX), big = items.filter(x => x.size > GH_GQL_MAX);
+        // pequenos: GraphQL em lotes (muito menos requisições)
+        const groups = []; let cur = [], curB = 0;
+        for (const it of small) { if (cur.length >= GH_GQL_BATCH || curB + it.size > GH_GQL_BYTES) { groups.push(cur); cur = []; curB = 0; } cur.push(it); curB += it.size; }
+        if (cur.length) groups.push(cur);
+        const leftovers = [];
+        await pool(groups, 3, async (g) => {
+          try {
+            const q = 'query{repository(owner:' + JSON.stringify(cfg.owner) + ',name:' + JSON.stringify(cfg.repo) + '){'
+              + g.map((it, i) => 'b' + i + ':object(oid:"' + it.sha + '"){...on Blob{text isTruncated isBinary}}').join(' ') + '}}';
+            const res = await req('POST', '/graphql', { query: q });
+            const repo = res && res.data && res.data.repository;
+            g.forEach((it, i) => {
+              const o = repo && repo['b' + i];
+              if (o && typeof o.text === 'string' && !o.isTruncated && !o.isBinary) { out.set(it.sha, o.text); doneBytes += it.size; }
+              else leftovers.push(it);
+            });
+          } catch (e) { if (e.status === 401) throw e; g.forEach(it => leftovers.push(it)); }
+          onProgress && onProgress(doneBytes, total);
+        });
+        // grandes (e o que o GraphQL não devolveu): REST, conteúdo bruto
+        await pool(big.concat(leftovers), 4, async (it) => {
+          const txt = await req('GET', R + '/git/blobs/' + it.sha, null, 'application/vnd.github.raw+json');
+          out.set(it.sha, txt); doneBytes += it.size; onProgress && onProgress(doneBytes, total);
+        });
+        return out;
+      },
+      // uploads: [{ sha, content }], removed: [sha]; retorna nova revisão
+      async commit(manifest, head, uploads, removed, onProgress) {
+        const entries = []; let sent = 0; const total = uploads.reduce((a, u) => a + u.bytes, 0);
+        // objetos grandes: blobs individuais (com pausa para respeitar o limite de criação do GitHub)
+        for (const u of uploads) {
+          if (u.bytes > GH_INLINE_MAX) {
+            const b = await req('POST', R + '/git/blobs', { content: bytesToB64(enc.encode(u.content)), encoding: 'base64' });
+            entries.push({ path: objPath(u.sha), mode: '100644', type: 'blob', sha: b.sha, _b: 0 });
+            sent += u.bytes; onProgress && onProgress(sent, total); await sleep(800);
+          } else entries.push({ path: objPath(u.sha), mode: '100644', type: 'blob', content: u.content, _b: u.bytes });
+        }
+        const manTxt = JSON.stringify(manifest);
+        if (manTxt.length > GH_INLINE_MAX) {
+          const b = await req('POST', R + '/git/blobs', { content: bytesToB64(enc.encode(manTxt)), encoding: 'base64' });
+          entries.push({ path: 'manifest.json', mode: '100644', type: 'blob', sha: b.sha, _b: 0 });
+        } else entries.push({ path: 'manifest.json', mode: '100644', type: 'blob', content: manTxt, _b: manTxt.length });
+        const dels = (removed || []).map(sha => ({ path: objPath(sha), mode: '100644', type: 'blob', sha: null, _b: 0 }));
+
+        async function buildTree(list) {
+          let tree = head.tree || undefined;
+          let group = [], gb = 0;
+          const flush = async () => {
+            if (!group.length) return;
+            const body = { tree: group.map(e => { const c = Object.assign({}, e); delete c._b; return c; }) };
+            if (tree) body.base_tree = tree;
+            const t = await req('POST', R + '/git/trees', body);
+            tree = t.sha; group.forEach(e => { if (e.content !== undefined) { sent += e._b; } }); onProgress && onProgress(Math.min(sent, total), total);
+            group = []; gb = 0;
+          };
+          for (const e of list) { if (group.length >= GH_TREE_ITEMS || (gb + e._b > GH_TREE_BYTES && group.length)) await flush(); group.push(e); gb += e._b; }
+          await flush();
+          return tree;
+        }
+        let tree, sentBefore = sent;
+        try { tree = await buildTree(entries.concat(dels)); }
+        catch (e) { if (!dels.length || e.status !== 422) throw e; sent = sentBefore; tree = await buildTree(entries); }  // ignora limpeza se falhar
+        const c = await req('POST', R + '/git/commits', {
+          message: 'sync ' + manifest.updatedAt + ' (' + (manifest.deviceName || manifest.device) + ')',
+          tree: tree, parents: head.rev ? [head.rev] : []
+        });
+        try {
+          if (head.rev) await req('PATCH', R + '/git/refs/heads/' + encodeURIComponent(cfg.branch), { sha: c.sha, force: false });
+          else await req('POST', R + '/git/refs', { ref: 'refs/heads/' + cfg.branch, sha: c.sha });
+        } catch (e) { if (e.status === 422 || e.status === 409) throw conflictError(); throw e; }
+        return c.sha;
+      }
+    };
+  }
+
+  /* =====================================================================
+     PROVEDOR: Firebase (Cloud Firestore)
+     academico_sync/{uid}/meta/head          → { rev, parts, updatedAt, device }
+     academico_sync/{uid}/mparts/{rev}__{i}  → manifesto em partes
+     academico_sync/{uid}/objs/{sha}__{i}    → conteúdo em partes (base64)
+     ===================================================================== */
+  let _fb = null, fbApp = null, fbAuth = null, fbDb = null, fbUser = null, fbReady = false;
+  async function loadFbSDK() {
+    if (_fb) return _fb;
+    const base = 'https://www.gstatic.com/firebasejs/' + FB_SDK_VER + '/';
+    const [appMod, authMod, fsMod] = await Promise.all([import(base + 'firebase-app.js'), import(base + 'firebase-auth.js'), import(base + 'firebase-firestore.js')]);
+    _fb = { app: appMod, auth: authMod, fs: fsMod }; return _fb;
+  }
+  async function initFirebase() {
+    if (fbReady && fbApp) return true;
+    if (!FBCONFIG) return false;
+    const fb = await loadFbSDK();
+    if (!fbApp) {
+      fbApp = fb.app.getApps().length ? fb.app.getApp() : fb.app.initializeApp(FBCONFIG);
+      fbAuth = fb.auth.getAuth(fbApp);
+      try { await fb.auth.setPersistence(fbAuth, fb.auth.browserLocalPersistence); } catch (e) {}
+      // Long-polling forçado: funciona atrás de proxies, antivírus e redes que bloqueiam o canal de streaming
+      try { fbDb = fb.fs.initializeFirestore(fbApp, { experimentalForceLongPolling: true }); }
+      catch (e) { fbDb = fb.fs.getFirestore(fbApp); }
+    }
+    await new Promise((resolve) => {
+      let done = false;
+      fb.auth.onAuthStateChanged(fbAuth, (u) => { fbUser = u || null; if (fbUser && !EMAIL) { EMAIL = fbUser.email; cfgSet('email', EMAIL || ''); } if (!done) { done = true; resolve(); } renderPanel(); });
+      setTimeout(() => { if (!done) { done = true; resolve(); } }, 8000);
+    });
+    fbReady = true; return true;
+  }
+  function withTimeout(p, ms, what) {
+    return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('Tempo esgotado ao ' + what + ' (o Firestore não respondeu).')), ms))]);
+  }
+  // Descobre o motivo REAL de "client is offline" consultando a API REST do Firestore
+  async function diagnoseFirestore() {
+    try {
+      if (!fbUser) return null;
+      const tok = await fbUser.getIdToken();
+      const url = 'https://firestore.googleapis.com/v1/projects/' + encodeURIComponent(FBCONFIG.projectId) + '/databases/(default)/documents/academico_sync/' + fbUser.uid + '/meta/head';
+      const r = await fetch(url, { headers: { Authorization: 'Bearer ' + tok }, cache: 'no-store' });
+      if (r.ok || r.status === 404) {
+        let body = ''; try { body = await r.text(); } catch (e) {}
+        if (r.status === 404 && /database.*does not exist|NOT_FOUND.*database/i.test(body)) return 'O banco Cloud Firestore não existe neste projeto. Crie-o em Firebase → Build → Firestore Database → Create database.';
+        return 'O servidor do Firestore responde normalmente, mas o SDK não conseguiu se conectar a partir deste navegador (extensão, antivírus, VPN ou rede bloqueando). Tente outra rede ou use o GitHub.';
+      }
+      let msg = ''; try { msg = (await r.json()).error.message; } catch (e) {}
+      if (r.status === 403) return 'As regras do Firestore estão bloqueando o acesso. Use: match /academico_sync/{uid}/{document=**} { allow read, write: if request.auth.uid == uid; }';
+      if (/has not been used|is disabled/i.test(msg)) return 'A API do Cloud Firestore está desativada neste projeto. Ative-a no Google Cloud Console.';
+      return 'Firestore ' + r.status + (msg ? ': ' + msg : '');
+    } catch (e) { return 'Sem conexão com os servidores do Google (verifique a internet).'; }
+  }
+  function FirebaseProvider() {
+    const fs = () => _fb.fs;
+    const uid = () => fbUser.uid;
+    const d = (...p) => fs().doc(fbDb, 'academico_sync', uid(), ...p);
+    async function wrap(p, what) {
+      try { return await p; }
+      catch (e) {
+        if (/offline|unavailable|Tempo esgotado/i.test(e.message || '') || e.code === 'unavailable') {
+          const why = await diagnoseFirestore(); if (why) throw new Error(why);
+        }
+        throw e;
+      }
+    }
+    async function readB64Parts(prefix, n) {
+      const parts = new Array(n);
+      await pool(Array.from({ length: n }, (_, i) => i), 6, async (i) => {
+        const s = await withTimeout(fs().getDocFromServer(d(prefix[0], prefix[1] + '__' + i)), 60000, 'baixar');
+        if (!s.exists()) throw new Error('Parte ausente na nuvem: ' + prefix[1] + '__' + i);
+        parts[i] = s.data().d || '';
+      });
+      return dec.decode(b64ToBytes(parts.join('')));
+    }
+    async function writeBatches(ops, onBytes) {
+      let batch = null, n = 0, bytes = 0;
+      const flush = async () => { if (batch && n) { await withTimeout(batch.commit(), 120000, 'enviar'); onBytes && onBytes(bytes); } batch = null; n = 0; bytes = 0; };
+      for (const op of ops) {
+        const sz = op.data ? op.data.d.length + 200 : 100;
+        if (batch && (n >= FB_BATCH_OPS || bytes + sz > FB_BATCH_BYTES)) await flush();
+        if (!batch) batch = fs().writeBatch(fbDb);
+        if (op.data) batch.set(op.ref, op.data); else batch.delete(op.ref);
+        n++; bytes += sz;
+      }
+      await flush();
+    }
+    function splitB64(str) { const b64 = bytesToB64(enc.encode(str)); const out = []; for (let o = 0; o < b64.length; o += FB_CHUNK_B64) out.push(b64.slice(o, o + FB_CHUNK_B64)); if (!out.length) out.push(''); return out; }
+    return {
+      name: 'firebase',
+      get label() { return (EMAIL || (fbUser && fbUser.email) || '') + ' · ' + (FBCONFIG && FBCONFIG.projectId); },
+      async check() { return true; },
+      async getRev() { const s = await wrap(withTimeout(fs().getDocFromServer(d('meta', 'head')), 30000, 'consultar')); return s.exists() ? s.data().rev : null; },
+      async getHead() {
+        const s = await wrap(withTimeout(fs().getDocFromServer(d('meta', 'head')), 30000, 'consultar'));
+        if (!s.exists()) return { rev: null, manifest: null };
+        const h = s.data();
+        const txt = await wrap(readB64Parts(['mparts', h.rev], h.parts || 1));
+        return { rev: h.rev, parts: h.parts || 1, manifest: JSON.parse(txt) };
+      },
+      async getObjects(items, onProgress) {
+        const out = new Map(); let done = 0; const total = items.reduce((a, b) => a + b.size, 0);
+        await pool(items, 4, async (it) => {
+          const n = Math.max(1, Math.ceil(b64Len(it.size) / FB_CHUNK_B64));
+          out.set(it.sha, await wrap(readB64Parts(['objs', it.sha], n)));
+          done += it.size; onProgress && onProgress(done, total);
+        });
+        return out;
+      },
+      async commit(manifest, head, uploads, removed, onProgress) {
+        const total = uploads.reduce((a, u) => a + u.bytes, 0); let sent = 0;
+        const ops = [];
+        for (const u of uploads) splitB64(u.content).forEach((c, i) => ops.push({ ref: d('objs', u.sha + '__' + i), data: { d: c } }));
+        const rev = 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        const mp = splitB64(JSON.stringify(manifest));
+        mp.forEach((c, i) => ops.push({ ref: d('mparts', rev + '__' + i), data: { d: c } }));
+        await wrap(writeBatches(ops, (b) => { sent += b * 0.75; onProgress && onProgress(Math.min(sent, total), total); }));
+        // troca a "cabeça" atomicamente — falha se outro aparelho enviou no meio
+        await wrap(withTimeout(fs().runTransaction(fbDb, async (tx) => {
+          const cur = await tx.get(d('meta', 'head'));
+          const curRev = cur.exists() ? cur.data().rev : null;
+          if (curRev !== (head.rev || null)) throw conflictError();
+          tx.set(d('meta', 'head'), { rev: rev, parts: mp.length, updatedAt: manifest.updatedAt, device: DEVICE });
+        }), 60000, 'confirmar envio')).catch(e => { if (e.conflict || /conflict|mudou/i.test(e.message || '')) throw conflictError(); throw e; });
+        // limpeza (melhor esforço)
+        try {
+          const del = [];
+          if (head.rev) { const oldParts = head.parts || 50; for (let i = 0; i < oldParts; i++) del.push({ ref: d('mparts', head.rev + '__' + i) }); }
+          for (const r of (removed || [])) { const it = removed.sizes && removed.sizes[r]; const n = it ? Math.max(1, Math.ceil(b64Len(it) / FB_CHUNK_B64)) : 1; for (let i = 0; i < n; i++) del.push({ ref: d('objs', r + '__' + i) }); }
+          if (del.length) writeBatches(del).catch(() => {});
+        } catch (e) {}
+        return rev;
+      }
+    };
+  }
+
+  /* ================== Motor de sincronização ================== */
+  function makeProvider() {
+    if (PROVIDER === 'github' && GHCFG) return GitHubProvider(GHCFG);
+    if (PROVIDER === 'firebase' && fbUser) return FirebaseProvider();
+    return null;
+  }
+  function deviceName() {
+    const ua = navigator.userAgent || '';
+    return /Android/i.test(ua) ? 'Android' : /iPhone|iPad/i.test(ua) ? 'iOS' : /Windows/i.test(ua) ? 'Windows' : /Mac/i.test(ua) ? 'Mac' : 'Web';
+  }
+  function countRecords(idx) { let n = 0; for (const k in idx) if (k.indexOf('st/') === 0) n++; return n; }
+
+  // Aplica decisões vindas da nuvem: [{ key, sha|null }] usando conteúdos já baixados
+  async function applyRemote(changes, contents, relocations) {
+    applying = true;
+    const touched = new Set();
+    try {
+      const puts = {}, dels = {};
+      for (const ch of changes) {
+        const p = parseKey(ch.key);
+        if (p.kind === 'ls') {
+          touched.add('__ls__');
+          if (ch.sha) { const v = contents.get(ch.sha); if (v != null) { try { _lsSet(p.name, v); } catch (e) {} } }
+          else _lsRemove(p.name);
+          continue;
+        }
+        if (storeNames().indexOf(p.store) < 0) continue;
+        touched.add(p.store);
+        if (ch.sha) { const txt = contents.get(ch.sha); if (txt == null) continue; let rec; try { rec = JSON.parse(txt); } catch (e) { continue; } (puts[p.store] = puts[p.store] || []).push(rec); }
+        else (dels[p.store] = dels[p.store] || []).push(p.id);
+      }
+      // registros criados nos dois aparelhos com o MESMO id: o local ganha um id novo (nada se perde)
+      for (const rl of relocations) {
+        const rec = Object.assign({}, rl.rec); delete rec.id;
+        await putOne(rl.store, rec); touched.add(rl.store);
+      }
+      for (const s in dels) await acad().deleteRecordsBatch(s, dels[s]);
+      for (const s in puts) await acad().putRecordsBatch(s, puts[s]);
     } finally { applying = false; }
+    touched.forEach(s => dirtyStores.add(s));
+    return touched.size > 0;
+  }
+
+  /**
+   * Um ciclo completo: baixa novidades, mescla por registro, aplica, envia o que falta.
+   * mode: 'merge' (normal) | 'remote' (nuvem substitui este aparelho) | 'local' (este aparelho substitui a nuvem)
+   */
+  async function syncCycle(mode) {
+    let asked = false;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      setStatus(attempt ? 'Nova tentativa…' : 'Verificando nuvem…'); setProgress('');
+      const head = await P.getHead();
+      const remote = (head.manifest && head.manifest.idx) || {};
+      let base = loadBase();
+      // base de outro repositório/conta, ou nuvem sem manifesto (nova/limpa) → não usa a base
+      // (evita interpretar "nuvem vazia" como "apague tudo deste aparelho")
+      if (base && (base.provider !== P.label || !head.manifest)) base = null;
+      setStatus('Comparando dados…');
+      let local = await localIndex(attempt === 0 && !idxCache);
+
+      // Primeira sincronização deste aparelho com uma nuvem que já tem dados → pergunta o que fazer
+      if (mode === 'merge' && !asked && !base && head.manifest && countRecords(remote) > 0) {
+        asked = true;
+        if (countRecords(local) === 0) mode = 'remote';
+        else {
+          const choice = await askFirstJoin(countRecords(local), countRecords(remote), head.manifest);
+          if (!choice) { setStatus('Aguardando sua escolha'); return { cancelled: true }; }
+          mode = choice;
+        }
+      }
+
+      // ---- decisão por chave (mesclagem em 3 vias) ----
+      const bidx = (base && base.idx) || {};
+      const changes = [], relocations = [];
+      const keys = new Set(Object.keys(local).concat(Object.keys(remote)));
+      for (const k of keys) {
+        const L = local[k] ? local[k][0] : null, Rr = remote[k] ? remote[k][0] : null, B = bidx[k] ? bidx[k][0] : null;
+        if (L === Rr) continue;
+        if (mode === 'local') continue;
+        if (mode === 'remote') { changes.push({ key: k, sha: Rr, size: Rr ? remote[k][1] : 0 }); continue; }
+        if (L === B) { changes.push({ key: k, sha: Rr, size: Rr ? remote[k][1] : 0 }); continue; }   // só a nuvem mudou
+        if (Rr === B) continue;                                                                          // só este aparelho mudou
+        // conflito: os dois mudaram
+        if (!Rr) continue;                                  // nuvem apagou, aqui editou → mantém a edição
+        if (!L) { changes.push({ key: k, sha: Rr, size: remote[k][1] }); continue; }   // aqui apagou, nuvem editou → restaura
+        const p = parseKey(k);
+        if (!B && p.kind === 'st' && typeof p.id === 'number') {
+          // criado nos dois aparelhos com o mesmo id → fica o da nuvem, e o local é recriado com outro id
+          const rec = await getRecord(p.store, p.id);
+          if (rec) relocations.push({ store: p.store, rec: rec });
+          changes.push({ key: k, sha: Rr, size: remote[k][1] });
+          continue;
+        }
+        // mesmo registro editado nos dois: vence quem está sincronizando agora (o último a salvar)
+      }
+
+      // ---- baixa e aplica ----
+      let pulled = 0;
+      if (changes.length || relocations.length) {
+        const need = new Map();
+        changes.forEach(c => { if (c.sha && !need.has(c.sha)) need.set(c.sha, { sha: c.sha, size: c.size }); });
+        const items = Array.from(need.values());
+        setStatus('Baixando ' + items.length + ' item(ns)…');
+        const contents = items.length ? await P.getObjects(items, (a, t) => setProgress(fmtMB(a) + ' de ' + fmtMB(t))) : new Map();
+        setStatus('Aplicando alterações…'); setProgress('');
+        await applyRemote(changes, contents, relocations);
+        pulled = changes.length;
+        local = await localIndex(false);
+      }
+
+      // ---- envia se o estado local ≠ nuvem ----
+      let same = Object.keys(local).length === Object.keys(remote).length;
+      if (same) for (const k in local) { if (!remote[k] || remote[k][0] !== local[k][0]) { same = false; break; } }
+      let rev = head.rev, pushed = 0;
+      if (!same || !head.manifest) {
+        const remoteShas = new Set(Object.values(remote).map(v => v[0]));
+        const uploads = [], seen = new Set();
+        const keysToUpload = Object.keys(local).filter(k => !remoteShas.has(local[k][0]));
+        setStatus('Preparando envio…');
+        for (const k of keysToUpload) {
+          const content = await localContent(k);
+          if (content == null) { delete local[k]; continue; }
+          const bytes = enc.encode(content);
+          const sha = await gitSha(bytes);
+          local[k] = [sha, bytes.length];
+          if (!seen.has(sha) && !remoteShas.has(sha)) { seen.add(sha); uploads.push({ sha: sha, content: content, bytes: bytes.length }); }
+        }
+        const localShas = new Set(Object.values(local).map(v => v[0]));
+        const removed = Array.from(remoteShas).filter(s => !localShas.has(s));
+        removed.sizes = {}; for (const k in remote) removed.sizes[remote[k][0]] = remote[k][1];
+        const manifest = { v: 4, app: 'academicopro', updatedAt: new Date().toISOString(), device: DEVICE, deviceName: deviceName(), idx: local };
+        const upBytes = uploads.reduce((a, u) => a + u.bytes, 0);
+        setStatus(uploads.length ? ('Enviando ' + uploads.length + ' item(ns) (' + fmtMB(upBytes) + ')…') : 'Enviando…');
+        try {
+          rev = await P.commit(manifest, head, uploads, removed, (a, t) => setProgress(fmtMB(a) + ' de ' + fmtMB(t)));
+        } catch (e) {
+          if (e.conflict) { console.warn('[sync] conflito, refazendo ciclo'); await sleep(800 + Math.random() * 1500); continue; }
+          throw e;
+        }
+        pushed = uploads.length || 1;
+      }
+      saveBase({ rev: rev, provider: P.label, idx: local });
+      lastSyncAt = new Date().toISOString(); cfgSet('lastSyncAt', lastSyncAt);
+      setProgress('');
+      return { pulled: pulled, pushed: pushed };
+    }
+    throw new Error('Outro aparelho está enviando ao mesmo tempo. Tente de novo em instantes.');
+  }
+
+  async function runSync(mode, opts) {
+    opts = opts || {};
+    if (!enabled || !booted || !P || !dbReady()) return false;
+    if (busy) { pendingSync = true; if (mode && mode !== 'merge') pendingMode = mode; return false; }
+    if (!navigator.onLine) { setStatus('Sem internet — sincroniza quando voltar'); renderPanel(); return false; }
+    busy = true; dirty = false; clearTimeout(pushTimer); renderPanel();
+    let ok = false;
+    try {
+      const r = await syncCycle(mode || 'merge');
+      ok = !r.cancelled;
+      if (ok) {
+        lastError = ''; setStatus('Sincronizado');
+        if (r.pulled) { toast('Dados atualizados da nuvem ✅', 'success'); await refreshApp(); }
+        else if (opts.manual) toast('Tudo sincronizado ✅', 'success');
+      }
+    } catch (e) {
+      console.warn('[sync]', e);
+      lastError = e.message || String(e); setStatus('Erro — veja abaixo'); setProgress('');
+      if (opts.manual || !opts.quiet) toast('Sincronização: ' + lastError, 'error');
+      dirty = true;
+    } finally {
+      busy = false; renderPanel();
+      if (pendingSync) { const m = pendingMode; pendingSync = false; pendingMode = null; setTimeout(() => runSync(m || 'merge', { quiet: true }), 300); }
+    }
+    return ok;
   }
 
   async function refreshApp() {
@@ -23154,417 +23711,258 @@ IMPORTANTE: Só inclua URLs reais que você encontrou na pesquisa. Não invente 
     try { location.reload(); } catch (e) {}
   }
 
-  /* ---------- Config (persistida no localStorage, prefixo __sync_) ---------- */
-  function cfgGet(k) { try { return localStorage.getItem('__sync_' + k); } catch (e) { return null; } }
-  function cfgSet(k, v) { try { _lsSet('__sync_' + k, v); } catch (e) {} }
-  function cfgDel(k) { try { _lsRemove('__sync_' + k); } catch (e) {} }
-  function loadCfg() {
-    try { FBCONFIG = JSON.parse(cfgGet('fbconfig') || 'null'); } catch (e) { FBCONFIG = null; }
-    EMAIL = cfgGet('email');
-    enabled = cfgGet('enabled') === '1' && !!FBCONFIG;
-    lastPulledAt = cfgGet('lastPulledAt'); lastPushedAt = cfgGet('lastPushedAt');
-    DEVICE = cfgGet('device');
-    if (!DEVICE) { DEVICE = 'dev_' + Math.random().toString(36).slice(2) + Date.now().toString(36); cfgSet('device', DEVICE); }
-  }
-
-  /* ---------- Toast simples ---------- */
-  function toast(msg, type) {
-    try {
-      let host = document.getElementById('__sync_toast');
-      if (!host) { host = document.createElement('div'); host.id = '__sync_toast'; host.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:99999;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none;'; document.body.appendChild(host); }
-      const el = document.createElement('div');
-      const bg = type === 'error' ? '#e74c3c' : (type === 'success' ? '#1abc9c' : '#34495e');
-      el.style.cssText = 'background:' + bg + ';color:#fff;padding:10px 16px;border-radius:10px;font:600 13px system-ui;box-shadow:0 8px 24px rgba(0,0,0,.25);max-width:88vw;text-align:center;';
-      el.textContent = msg; host.appendChild(el);
-      setTimeout(() => { el.style.transition = 'opacity .4s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 400); }, 3000);
-    } catch (e) {}
-  }
-  function setStatus(s) { statusText = s; const e = document.getElementById('sync-status'); if (e) e.textContent = s; }
-
-  /* ---------- Firebase: carregamento do SDK + módulos ---------- */
-  let _fb = null;
-  async function loadSDK() {
-    if (_fb) return _fb;
-    const base = 'https://www.gstatic.com/firebasejs/' + SDK_VER + '/';
-    const [appMod, authMod, fsMod] = await Promise.all([
-      import(base + 'firebase-app.js'),
-      import(base + 'firebase-auth.js'),
-      import(base + 'firebase-firestore.js')
-    ]);
-    _fb = { app: appMod, auth: authMod, fs: fsMod };
-    return _fb;
-  }
-
-  // Inicializa o app Firebase e tenta restaurar a sessão persistida.
-  // Resolve quando o estado de autenticação inicial é conhecido.
-  async function initFirebase() {
-    if (fbReady && fbApp) return true;
-    if (!FBCONFIG) return false;
-    fbLoading = true;
-    const fb = await loadSDK();
-    if (!fbApp) {
-      fbApp = fb.app.getApps && fb.app.getApps().length ? fb.app.getApp() : fb.app.initializeApp(FBCONFIG);
-      fbAuth = fb.auth.getAuth(fbApp);
-      try { await fb.auth.setPersistence(fbAuth, fb.auth.browserLocalPersistence); } catch (e) {}
-      fbDb = fb.fs.getFirestore(fbApp);
-    }
-    // Espera o primeiro disparo de onAuthStateChanged
-    await new Promise((resolve) => {
-      let done = false;
-      const unsub = fb.auth.onAuthStateChanged(fbAuth, (u) => {
-        fbUser = u || null;
-        if (fbUser && !EMAIL) { EMAIL = fbUser.email; cfgSet('email', EMAIL || ''); }
-        if (!done) { done = true; resolve(); }
-        renderPanel();
-      });
-      // segurança: não trava se algo der errado
-      setTimeout(() => { if (!done) { done = true; resolve(); } }, 6000);
-      void unsub;
-    });
-    fbReady = true; fbLoading = false;
-    return true;
-  }
-
-  function userRoot() { return fbUser ? ('academico_sync/' + fbUser.uid) : null; }
-
-  /* ---------- Firestore: leitura ---------- */
-  async function fsGetManifest() {
-    const fb = _fb;
-    const ref = fb.fs.doc(fbDb, 'academico_sync', fbUser.uid, 'data', 'manifest');
-    const snap = await fb.fs.getDoc(ref);
-    return snap.exists() ? snap.data() : null;
-  }
-  async function fsReadChunks(name, parts) {
-    const fb = _fb; const out = [];
-    for (let p = 0; p < parts; p++) {
-      try {
-        const ref = fb.fs.doc(fbDb, 'academico_sync', fbUser.uid, 'chunks', name + '__' + p);
-        const snap = await fb.fs.getDoc(ref);
-        out.push(snap.exists() ? (snap.data().d || '') : '');
-      } catch (e) { out.push(''); }
-    }
-    return out;
-  }
-
-  /* ---------- Firestore: escrita (manifesto + chunks, com limpeza dos antigos) ---------- */
-  async function fsWriteAll(stores, ls) {
-    const fb = _fb;
-    const uid = fbUser.uid;
-    const chunkCol = fb.fs.collection(fbDb, 'academico_sync', uid, 'chunks');
-
-    // ids dos chunks que já existem na nuvem (para apagar os que sobrarem)
-    const existing = {};
-    try {
-      const snap = await fb.fs.getDocs(chunkCol);
-      snap.forEach(d => { existing[d.id] = true; });
-    } catch (e) {}
-
-    // monta o conjunto desejado de chunks
-    const desired = {};   // id -> string base64
-    const meta = {};      // storeName -> parts
-    let total = 0;
-    const allStores = Object.assign({}, stores);
-    allStores['__ls__'] = [ls || {}];   // localStorage entra como uma "store" especial
-    for (const name in allStores) {
-      const parts = recsToChunks(allStores[name]);
-      meta[name] = parts.length;
-      parts.forEach((str, idx) => { desired[name + '__' + idx] = str; total += str.length; });
-    }
-
-    const updatedAt = new Date().toISOString();
-    const manifest = { v: 3, app: 'academicopro', updatedAt: updatedAt, device: DEVICE, stores: meta };
-
-    // operações: escreve chunks desejados, apaga chunks órfãos, grava manifesto
-    const ops = [];
-    for (const id in desired) ops.push({ type: 'set', id: id, data: { d: desired[id] } });
-    for (const id in existing) { if (!(id in desired)) ops.push({ type: 'del', id: id }); }
-
-    // executa em lotes (batches) respeitando o limite do Firestore
-    for (let i = 0; i < ops.length; i += BATCH_OPS) {
-      const batch = fb.fs.writeBatch(fbDb);
-      for (const op of ops.slice(i, i + BATCH_OPS)) {
-        const ref = fb.fs.doc(fbDb, 'academico_sync', uid, 'chunks', op.id);
-        if (op.type === 'set') batch.set(ref, op.data); else batch.delete(ref);
-      }
-      await batch.commit();
-    }
-    // manifesto por último (marca a versão como pronta)
-    const manRef = fb.fs.doc(fbDb, 'academico_sync', uid, 'data', 'manifest');
-    await fb.fs.setDoc(manRef, manifest);
-
-    return { updatedAt: updatedAt, total: total };
-  }
-
-  /* ---------- Baixar (pull) ---------- */
-  async function doPull(force) {
-    if (!enabled || !fbReady || !fbUser || applying || busy || !dbReady()) return false;
-    busy = true; setStatus('Verificando nuvem…'); renderPanel();
-    let ok = false, changed = false;
-    try {
-      const man = await fsGetManifest();
-      if (!man) { setStatus('Sincronizado'); ok = true; lastError = ''; }
-      else {
-        const isNewer = force || !lastPulledAt || (man.updatedAt && man.updatedAt > lastPulledAt);
-        const isOurs = man.device === DEVICE && man.updatedAt === lastPushedAt;
-        if (isNewer && !isOurs) {
-          setStatus('Baixando…'); renderPanel();
-          const meta = man.stores || {};
-          const stores = {}; let ls = {};
-          for (const name in meta) {
-            const parts = await fsReadChunks(name, meta[name] || 1);
-            if (name === '__ls__') {
-              const arr = chunksToRecs(parts);
-              ls = (arr && arr[0]) ? arr[0] : {};
-            } else {
-              stores[name] = chunksToRecs(parts);
-            }
-          }
-          await applyData(stores, ls);
-          changed = true;
-        }
-        lastPulledAt = man.updatedAt; cfgSet('lastPulledAt', man.updatedAt || '');
-        setStatus('Sincronizado'); ok = true; lastError = '';
-      }
-    } catch (e) { console.warn(e); lastError = e.message || String(e); setStatus('Erro: ' + lastError); toast('Sincronização: ' + lastError, 'error'); }
-    finally { busy = false; renderPanel(); }
-    if (changed) { toast('Dados atualizados da nuvem ✅', 'success'); await refreshApp(); }
-    return ok;
-  }
-
-  /* ---------- Enviar (push) ---------- */
-  async function doPush() {
-    if (!enabled || !fbReady || !fbUser || applying || busy || !dbReady()) return;
-    busy = true; pendingPush = false; setStatus('Enviando…'); renderPanel();
-    try {
-      const stores = await collectStores();
-      const ls = collectLS();
-      const res = await fsWriteAll(stores, ls);
-      lastPushedAt = res.updatedAt; lastPulledAt = res.updatedAt;
-      cfgSet('lastPushedAt', res.updatedAt); cfgSet('lastPulledAt', res.updatedAt);
-      dirty = false; lastError = ''; setStatus('Sincronizado');
-      console.log('[sync] enviado ' + (res.total / 1048576).toFixed(2) + ' MB (base64) para o Firestore');
-    } catch (e) {
-      console.warn(e); lastError = e.message || String(e); setStatus('Erro: ' + lastError);
-      toast('Falha ao enviar: ' + lastError, 'error'); pendingPush = true;
-    } finally {
-      busy = false; renderPanel();
-      if (pendingPush && enabled) { pendingPush = false; clearTimeout(pushTimer); pushTimer = setTimeout(() => doPush(), PUSH_DELAY); }
-    }
-  }
-
-  async function syncNow() { await doPull(false); await doPush(); }
-
-  function markDirty() {
-    if (!enabled || applying || !booted || !fbReady) return;
+  function markDirty(store) {
+    if (store) dirtyStores.add(store);
+    if (!enabled || applying || !booted || !P) return;
     dirty = true; setStatus('Alterações pendentes…');
-    if (busy) { pendingPush = true; return; }
-    clearTimeout(pushTimer); pushTimer = setTimeout(() => doPush(), PUSH_DELAY);
+    if (busy) { pendingSync = true; return; }
+    clearTimeout(pushTimer); pushTimer = setTimeout(() => runSync('merge', { quiet: true }), PUSH_DELAY);
   }
 
-  /* ---------- Conectar (entrar / criar conta) / pausar / esquecer ---------- */
-  function parseConfig(raw) {
-    if (!raw) return null;
-    let txt = String(raw).trim();
-    // aceita o objeto colado como "const firebaseConfig = {...};" ou só "{...}"
-    const m = txt.match(/\{[\s\S]*\}/);
-    if (m) txt = m[0];
-    // remove vírgula final e converte chaves sem aspas em JSON válido
-    try { return JSON.parse(txt); } catch (e) {}
+  // Checagem leve: só baixa se a revisão da nuvem mudou
+  async function pollRemote() {
+    if (!enabled || !booted || !P || busy || document.hidden || !navigator.onLine) return;
     try {
-      // tenta avaliar com segurança um literal de objeto JS simples
-      // eslint-disable-next-line no-new-func
-      const obj = (new Function('return (' + txt + ')'))();
-      return (obj && obj.apiKey && obj.projectId) ? obj : null;
-    } catch (e) { return null; }
+      const base = loadBase(); const rev = await P.getRev();
+      if (!base || rev !== base.rev || dirty) runSync('merge', { quiet: true });
+    } catch (e) { /* silencioso */ }
   }
 
-  async function saveConfig(rawConfig) {
-    const cfg = parseConfig(rawConfig);
-    if (!cfg || !cfg.apiKey || !cfg.projectId) { toast('Configuração do Firebase inválida. Cole o objeto firebaseConfig completo.', 'error'); return false; }
-    FBCONFIG = cfg; cfgSet('fbconfig', JSON.stringify(cfg));
-    fbReady = false; fbApp = null;
-    setStatus('Inicializando Firebase…'); renderPanel();
-    try { await initFirebase(); toast('Firebase configurado. Agora entre com e-mail e senha.', 'success'); renderPanel(); return true; }
-    catch (e) { lastError = e.message || String(e); toast('Falha ao inicializar Firebase: ' + lastError, 'error'); renderPanel(); return false; }
+  /* ================== Primeira conexão: escolha ================== */
+  function askFirstJoin(nLocal, nRemote, man) {
+    return new Promise((resolve) => {
+      const ov = document.createElement('div');
+      ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100000;display:flex;align-items:center;justify-content:center;padding:16px;';
+      ov.innerHTML = '<div style="background:#fff;color:#222;max-width:460px;width:100%;border-radius:14px;padding:20px;font:14px system-ui;box-shadow:0 20px 50px rgba(0,0,0,.35);">'
+        + '<h5 style="margin:0 0 8px;font-weight:700;"><i class="fas fa-cloud me-2" style="color:#0dcaf0"></i>Já existem dados na nuvem</h5>'
+        + '<p style="margin:0 0 6px;font-size:13px;color:#555;">Nuvem: <strong>' + nRemote + '</strong> registros (último envio ' + esc(fmtWhen(man.updatedAt)) + (man.deviceName ? ', ' + esc(man.deviceName) : '') + ').<br>Este aparelho: <strong>' + nLocal + '</strong> registros.</p>'
+        + '<p style="margin:0 0 14px;font-size:13px;color:#555;">O que fazer neste aparelho?</p>'
+        + '<button data-c="remote" class="btn btn-info text-white w-100 mb-2"><i class="fas fa-cloud-arrow-down me-1"></i> Usar os dados da nuvem <small>(recomendado)</small></button>'
+        + '<button data-c="merge" class="btn btn-outline-info w-100 mb-2"><i class="fas fa-code-merge me-1"></i> Juntar os dois</button>'
+        + '<button data-c="local" class="btn btn-outline-danger w-100 mb-2"><i class="fas fa-cloud-arrow-up me-1"></i> Substituir a nuvem por este aparelho</button>'
+        + '<button data-c="" class="btn btn-link w-100 text-muted">Decidir depois</button></div>';
+      ov.addEventListener('click', (ev) => {
+        const b = ev.target.closest('button[data-c]'); if (!b) return;
+        const c = b.getAttribute('data-c');
+        if (c === 'local' && !confirm('Isto apaga da nuvem tudo o que não existe neste aparelho (inclusive o que foi feito nos outros aparelhos). Continuar?')) return;
+        ov.remove(); resolve(c || null);
+      });
+      document.body.appendChild(ov);
+    });
   }
 
-  async function signIn(email, pass, create) {
-    if (!FBCONFIG) { toast('Configure o Firebase primeiro.', 'error'); return; }
+  /* ================== Conectar / pausar / sair ================== */
+  function parseRepo(txt) {
+    txt = String(txt || '').trim().replace(/\.git$/, '').replace(/\/+$/, '');
+    const m = txt.match(/github\.com[/:]([^/\s]+)\/([^/\s]+)/i) || txt.match(/^([^/\s]+)\/([^/\s]+)$/);
+    return m ? { owner: m[1], repo: m[2] } : null;
+  }
+  async function connectGitHub(repoTxt, token) {
+    const rp = parseRepo(repoTxt);
+    if (!rp) { toast('Informe o repositório como usuario/repositorio.', 'error'); return; }
+    token = String(token || '').trim();
+    if (!token) { toast('Cole o token do GitHub.', 'error'); return; }
+    if (!dbReady()) { toast('Aguarde o app carregar e tente de novo.', 'error'); return; }
+    busy = true; setStatus('Conectando ao GitHub…'); lastError = ''; renderPanel();
+    try {
+      const tmp = GitHubProvider({ owner: rp.owner, repo: rp.repo, branch: 'main', token: token });
+      const info = await tmp.check();
+      if (info.private === false && !confirm('ATENÇÃO: o repositório "' + rp.owner + '/' + rp.repo + '" é PÚBLICO — qualquer pessoa poderia ver seus dados. Recomendo torná-lo privado. Continuar mesmo assim?')) { busy = false; setStatus('Não configurado'); renderPanel(); return; }
+      GHCFG = { owner: rp.owner, repo: rp.repo, branch: info.default_branch || 'main', token: token };
+      cfgSet('gh', JSON.stringify(GHCFG)); PROVIDER = 'github'; cfgSet('provider', 'github');
+      enabled = true; cfgSet('enabled', '1');
+      P = makeProvider(); busy = false;
+      toast('GitHub conectado ✅ Sincronizando…', 'success');
+      await runSync('merge', { manual: true });
+    } catch (e) {
+      busy = false; lastError = e.message || String(e); setStatus('Erro — veja abaixo'); toast(lastError, 'error'); renderPanel();
+    }
+  }
+
+  function parseFbConfig(raw) {
+    if (!raw) return null;
+    let txt = String(raw).trim(); const m = txt.match(/\{[\s\S]*\}/); if (m) txt = m[0];
+    try { return JSON.parse(txt); } catch (e) {}
+    try { const obj = (new Function('return (' + txt + ')'))(); return (obj && obj.apiKey && obj.projectId) ? obj : null; } catch (e) { return null; }
+  }
+  async function saveFbConfig(raw) {
+    const cfg = parseFbConfig(raw);
+    if (!cfg || !cfg.apiKey || !cfg.projectId) { toast('Configuração do Firebase inválida. Cole o objeto firebaseConfig completo.', 'error'); return; }
+    FBCONFIG = cfg; cfgSet('fbconfig', JSON.stringify(cfg)); PROVIDER = 'firebase'; cfgSet('provider', 'firebase');
+    fbReady = false; fbApp = null; renderPanel();
+    try { await initFirebase(); toast('Firebase configurado. Agora entre com e-mail e senha.', 'success'); }
+    catch (e) { lastError = e.message || String(e); toast('Falha ao inicializar Firebase: ' + lastError, 'error'); }
+    renderPanel();
+  }
+  async function signInFirebase(email, pass, create) {
     if (!email || !pass) { toast('Informe e-mail e senha.', 'error'); return; }
     if (!dbReady()) { toast('Aguarde o app carregar e tente de novo.', 'error'); return; }
     busy = true; setStatus(create ? 'Criando conta…' : 'Entrando…'); renderPanel();
     try {
       await initFirebase();
-      const fb = _fb;
-      if (create) await fb.auth.createUserWithEmailAndPassword(fbAuth, email.trim(), pass);
-      else        await fb.auth.signInWithEmailAndPassword(fbAuth, email.trim(), pass);
+      if (create) await _fb.auth.createUserWithEmailAndPassword(fbAuth, email.trim(), pass);
+      else await _fb.auth.signInWithEmailAndPassword(fbAuth, email.trim(), pass);
       fbUser = fbAuth.currentUser; EMAIL = fbUser ? fbUser.email : email.trim();
       cfgSet('email', EMAIL || ''); enabled = true; cfgSet('enabled', '1');
-      busy = false;
-
-      // Há dados na nuvem para esta conta?
-      let hasRemote = false;
-      try { hasRemote = !!(await fsGetManifest()); } catch (e) {}
-      if (hasRemote) { await doPull(true); }   // entra numa sincronização existente: a nuvem manda
-      else { await doPush(); }                  // primeira vez: envia o que já existe local
-      setStatus('Sincronizado'); toast('Sincronização ativada ✅', 'success'); renderPanel();
+      P = makeProvider(); busy = false;
+      await runSync('merge', { manual: true });
     } catch (e) {
-      busy = false; const code = e && e.code ? e.code : '';
-      let msg = e.message || String(e);
+      busy = false; const code = e && e.code ? e.code : ''; let msg = e.message || String(e);
       if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found') msg = 'E-mail ou senha incorretos (ou conta inexistente — use "Criar conta").';
       else if (code === 'auth/email-already-in-use') msg = 'Este e-mail já tem conta. Use "Entrar".';
       else if (code === 'auth/weak-password') msg = 'Senha muito fraca (mínimo 6 caracteres).';
       else if (code === 'auth/operation-not-allowed') msg = 'Ative o provedor "E-mail/Senha" em Authentication no console do Firebase.';
-      lastError = msg; setStatus('Erro: ' + msg); toast(msg, 'error'); renderPanel();
+      lastError = msg; setStatus('Erro — veja abaixo'); toast(msg, 'error'); renderPanel();
     }
   }
 
-  async function disconnect() { enabled = false; cfgSet('enabled', '0'); setStatus('Pausada'); toast('Sincronização pausada'); renderPanel(); }
+  function pauseToggle() {
+    if (enabled) { enabled = false; cfgSet('enabled', '0'); setStatus('Pausada'); toast('Sincronização pausada'); renderPanel(); }
+    else { enabled = true; cfgSet('enabled', '1'); P = P || makeProvider(); renderPanel(); runSync('merge', { manual: true }); }
+  }
   async function forget() {
+    if (!confirm('Desconectar este aparelho da sincronização? (Os dados locais e os da nuvem NÃO são apagados.)')) return;
     enabled = false;
     try { if (fbAuth && _fb) await _fb.auth.signOut(fbAuth); } catch (e) {}
-    ['fbconfig', 'email', 'enabled', 'lastPulledAt', 'lastPushedAt'].forEach(cfgDel);
-    FBCONFIG = null; EMAIL = null; fbUser = null; fbReady = false; fbApp = null;
-    lastPulledAt = null; lastPushedAt = null;
-    setStatus('Não configurado'); toast('Credenciais removidas deste aparelho'); renderPanel();
+    ['gh', 'fbconfig', 'email', 'enabled', 'provider', 'lastSyncAt', 'lastPulledAt', 'lastPushedAt', 'base_github', 'base_firebase'].forEach(cfgDel);
+    GHCFG = null; FBCONFIG = null; EMAIL = null; fbUser = null; fbReady = false; fbApp = null; PROVIDER = null; P = null; lastSyncAt = null; lastError = '';
+    setStatus('Não configurado'); toast('Sincronização removida deste aparelho'); renderPanel();
+  }
+  function forceMode(mode) {
+    const msg = mode === 'local'
+      ? 'Substituir a NUVEM pelos dados deste aparelho? O que existir só nos outros aparelhos será apagado da nuvem.'
+      : 'Substituir os dados DESTE aparelho pelos da nuvem? O que existir só aqui será apagado.';
+    if (confirm(msg)) runSync(mode, { manual: true });
   }
 
-  /* ---------- Interface (Bootstrap, painel Configurações) ---------- */
+  /* ================== Interface ================== */
   function fmtWhen(iso) { if (!iso) return '—'; try { return new Date(iso).toLocaleString('pt-BR'); } catch (e) { return iso; } }
-  function esc(s) { return String(s == null ? '' : s).replace(/</g, '&lt;'); }
-  function errHtml() {
-    let h = '';
-    if (lastError) h += '<div class="alert alert-danger mt-3 mb-0" style="font-size:0.78rem;"><strong>Último erro:</strong> ' + esc(lastError) + '</div>';
-    return h;
-  }
+  function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;'); }
+  function errHtml() { return lastError ? '<div class="alert alert-danger mt-3 mb-0" style="font-size:0.8rem;"><strong>Último erro:</strong> ' + esc(lastError) + '</div>' : ''; }
+  let uiChoice = null;   // escolha de serviço na tela inicial
 
   function renderPanel() {
     const host = document.getElementById('sync-panel');
     if (!host) return;
     const on = (id, fn) => { const e = document.getElementById(id); if (e) e.onclick = fn; };
+    const val = (id) => (document.getElementById(id) || {}).value || '';
+    const title = '<h4 class="card-title"><i class="fas fa-cloud me-2 text-info"></i>Sincronização entre aparelhos</h4>';
+    const card = (inner) => '<div class="card card-dashboard mb-4"><div class="card-body">' + title + inner + '</div></div>';
 
-    // 1) Sem configuração do Firebase → formulário de configuração
-    if (!FBCONFIG) {
-      host.innerHTML =
-        '<div class="card card-dashboard mb-4"><div class="card-body">'
-        + '<h4 class="card-title"><i class="fas fa-cloud me-2 text-info"></i>Sincronização na nuvem (Firebase)</h4>'
-        + '<p class="text-muted mb-3" style="font-size:0.85rem;">Mantém todos os seus dados iguais em todos os aparelhos usando o <strong>Firebase (Cloud Firestore)</strong> — grátis no plano Spark. Inclui <strong>PDFs, imagens e documentos</strong> (divididos automaticamente). Baixa ao abrir e envia a cada alteração.</p>'
-        + '<ol style="font-size:0.82rem;color:#6c757d;padding-left:18px;line-height:1.7;">'
-        + '<li>Acesse <a href="https://console.firebase.google.com/" target="_blank" rel="noopener">console.firebase.google.com</a> e crie um projeto.</li>'
-        + '<li>Em <strong>Build → Firestore Database</strong>, clique em <em>Create database</em> (pode iniciar em modo de produção).</li>'
-        + '<li>Em <strong>Build → Authentication → Sign-in method</strong>, ative <strong>E-mail/senha</strong>.</li>'
-        + '<li>Em <strong>Project settings → Your apps</strong>, registre um app <em>Web</em> (&lt;/&gt;) e copie o objeto <code>firebaseConfig</code>.</li>'
-        + '<li>Cole o objeto abaixo. Use a <strong>mesma conta de e-mail/senha</strong> em todos os aparelhos.</li>'
-        + '</ol>'
-        + '<label class="form-label mt-1" style="font-size:0.8rem;font-weight:600;">Objeto firebaseConfig</label>'
-        + '<textarea class="form-control" id="sync-fbconfig" rows="7" placeholder="{ apiKey: \'...\', authDomain: \'...\', projectId: \'...\', ... }" style="font-family:monospace;font-size:0.78rem;"></textarea>'
-        + '<button class="btn btn-info w-100 mt-3 text-white" id="sync-save-cfg-btn"><i class="fas fa-save me-1"></i> Salvar configuração</button>'
-        + '<div class="alert alert-secondary mt-3 mb-0" style="font-size:0.76rem;"><i class="fas fa-shield-halved me-1"></i> Para proteger seus dados, em <strong>Firestore → Rules</strong> use regras que só permitam o dono ler/escrever. Exemplo: <code>match /academico_sync/{uid}/{document=**} { allow read, write: if request.auth.uid == uid; }</code></div>'
-        + errHtml()
-        + '</div></div>';
-      on('sync-save-cfg-btn', () => saveConfig((document.getElementById('sync-fbconfig') || {}).value || ''));
+    const connected = (PROVIDER === 'github' && GHCFG) || (PROVIDER === 'firebase' && FBCONFIG && fbUser);
+
+    if (!connected) {
+      const choice = uiChoice || (PROVIDER === 'firebase' && FBCONFIG ? 'firebase' : 'github');
+      let h = '<p class="text-muted mb-3" style="font-size:0.85rem;">Mantém os dados iguais em todos os seus aparelhos (inclui PDFs e imagens). Só o que mudou é enviado ou baixado, e alterações feitas em aparelhos diferentes são <strong>mescladas</strong>.</p>'
+        + '<div class="btn-group w-100 mb-3" role="group">'
+        + '<button class="btn ' + (choice === 'github' ? 'btn-dark' : 'btn-outline-dark') + '" id="sync-pick-gh"><i class="fab fa-github me-1"></i> GitHub <small>(recomendado)</small></button>'
+        + '<button class="btn ' + (choice === 'firebase' ? 'btn-warning' : 'btn-outline-warning') + '" id="sync-pick-fb"><i class="fas fa-fire me-1"></i> Firebase</button></div>';
+      if (choice === 'github') {
+        h += '<ol style="font-size:0.82rem;color:#6c757d;padding-left:18px;line-height:1.7;">'
+          + '<li>Crie um repositório <strong>privado</strong> e vazio (ex.: <code>academicopro-dados</code>) em <a href="https://github.com/new" target="_blank" rel="noopener">github.com/new</a>.</li>'
+          + '<li>Crie um token em <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">Settings → Developer settings → Fine-grained tokens</a>: <em>Repository access</em> → <strong>Only select repositories</strong> → esse repositório; <em>Permissions</em> → <strong>Contents: Read and write</strong>. Escolha uma validade longa.</li>'
+          + '<li>Cole o repositório e o token abaixo. Use <strong>os mesmos</strong> em todos os aparelhos.</li></ol>'
+          + '<input class="form-control mb-2" id="sync-gh-repo" placeholder="usuario/academicopro-dados" value="' + esc(GHCFG ? GHCFG.owner + '/' + GHCFG.repo : '') + '">'
+          + '<div class="input-group mb-3"><input type="password" class="form-control" id="sync-gh-token" placeholder="github_pat_…" autocomplete="off"><button class="btn btn-outline-secondary" type="button" id="sync-tok-eye"><i class="fas fa-eye"></i></button></div>'
+          + '<button class="btn btn-dark w-100" id="sync-gh-connect"' + (busy ? ' disabled' : '') + '><i class="fab fa-github me-1"></i> Conectar</button>'
+          + '<div class="alert alert-secondary mt-3 mb-0" style="font-size:0.76rem;"><i class="fas fa-shield-halved me-1"></i> O token fica salvo só neste navegador e dá acesso apenas ao repositório escolhido. O GitHub ainda guarda o histórico de versões dos seus dados.</div>';
+      } else if (!FBCONFIG) {
+        h += '<ol style="font-size:0.82rem;color:#6c757d;padding-left:18px;line-height:1.7;">'
+          + '<li>Em <a href="https://console.firebase.google.com/" target="_blank" rel="noopener">console.firebase.google.com</a>, crie um projeto.</li>'
+          + '<li><strong>Build → Firestore Database → Create database</strong> (sem isso aparece "client is offline").</li>'
+          + '<li><strong>Build → Authentication → Sign-in method</strong>: ative <strong>E-mail/senha</strong>.</li>'
+          + '<li><strong>Project settings → Your apps</strong>: registre um app Web e copie o <code>firebaseConfig</code>.</li></ol>'
+          + '<textarea class="form-control" id="sync-fbconfig" rows="6" placeholder="{ apiKey: \'...\', authDomain: \'...\', projectId: \'...\', ... }" style="font-family:monospace;font-size:0.78rem;"></textarea>'
+          + '<button class="btn btn-warning w-100 mt-3" id="sync-save-cfg-btn"><i class="fas fa-save me-1"></i> Salvar configuração</button>'
+          + '<div class="alert alert-secondary mt-3 mb-0" style="font-size:0.76rem;">Regras do Firestore: <code>match /academico_sync/{uid}/{document=**} { allow read, write: if request.auth.uid == uid; }</code></div>';
+      } else {
+        h += '<p class="text-muted mb-2" style="font-size:0.84rem;">Firebase configurado (projeto <code>' + esc(FBCONFIG.projectId) + '</code>). Entre com a <strong>mesma conta</strong> em todos os aparelhos.</p>'
+          + '<input type="email" class="form-control mb-2" id="sync-email" placeholder="seu@email.com" autocomplete="username" value="' + esc(EMAIL || '') + '">'
+          + '<input type="password" class="form-control mb-3" id="sync-pass" placeholder="senha (mín. 6)" autocomplete="current-password">'
+          + '<div class="d-flex gap-2"><button class="btn btn-warning flex-fill" id="sync-login-btn"' + (busy ? ' disabled' : '') + '>Entrar</button>'
+          + '<button class="btn btn-outline-warning flex-fill" id="sync-create-btn"' + (busy ? ' disabled' : '') + '>Criar conta</button></div>'
+          + '<button class="btn btn-sm btn-link text-danger p-0 mt-3" id="sync-fb-reset">Trocar projeto do Firebase</button>';
+      }
+      host.innerHTML = card(h + (busy ? '<p class="text-muted mt-2 mb-0" style="font-size:0.8rem;"><i class="fas fa-spinner fa-spin me-1"></i>' + esc(statusText) + '</p>' : '') + errHtml());
+      on('sync-pick-gh', () => { uiChoice = 'github'; renderPanel(); });
+      on('sync-pick-fb', () => { uiChoice = 'firebase'; renderPanel(); });
+      on('sync-tok-eye', () => { const i = document.getElementById('sync-gh-token'); if (i) i.type = i.type === 'password' ? 'text' : 'password'; });
+      on('sync-gh-connect', () => connectGitHub(val('sync-gh-repo'), val('sync-gh-token')));
+      on('sync-save-cfg-btn', () => saveFbConfig(val('sync-fbconfig')));
+      on('sync-login-btn', () => signInFirebase(val('sync-email'), val('sync-pass'), false));
+      on('sync-create-btn', () => signInFirebase(val('sync-email'), val('sync-pass'), true));
+      on('sync-fb-reset', () => { cfgDel('fbconfig'); FBCONFIG = null; fbApp = null; fbReady = false; renderPanel(); });
       return;
     }
 
-    // 2) Config OK, mas sem login → formulário de login/criação
-    if (!fbUser) {
-      host.innerHTML =
-        '<div class="card card-dashboard mb-4"><div class="card-body">'
-        + '<h4 class="card-title"><i class="fas fa-cloud me-2 text-info"></i>Sincronização na nuvem (Firebase)</h4>'
-        + '<p class="text-muted mb-2" style="font-size:0.84rem;">Firebase configurado ✓. Entre com a <strong>mesma conta</strong> em todos os aparelhos para compartilhar os dados.</p>'
-        + (fbLoading ? '<p class="text-muted" style="font-size:0.8rem;"><i class="fas fa-spinner fa-spin me-1"></i>Conectando ao Firebase…</p>' : '')
-        + '<div class="mb-2"><input type="email" class="form-control" id="sync-email" placeholder="seu@email.com" autocomplete="username" value="' + esc(EMAIL || '') + '"></div>'
-        + '<div class="input-group mb-3"><input type="password" class="form-control" id="sync-pass" placeholder="senha (mín. 6)" autocomplete="current-password"><button class="btn btn-outline-secondary" type="button" id="sync-pass-eye"><i class="fas fa-eye"></i></button></div>'
-        + '<div class="d-flex gap-2">'
-        + '<button class="btn btn-info text-white flex-fill" id="sync-login-btn"' + (busy ? ' disabled' : '') + '><i class="fas fa-right-to-bracket me-1"></i> Entrar</button>'
-        + '<button class="btn btn-outline-info flex-fill" id="sync-create-btn"' + (busy ? ' disabled' : '') + '><i class="fas fa-user-plus me-1"></i> Criar conta</button>'
-        + '</div>'
-        + '<button class="btn btn-sm btn-link text-danger p-0 mt-3" id="sync-forget-btn"><i class="fas fa-trash me-1"></i>Remover configuração deste aparelho</button>'
-        + errHtml()
-        + '</div></div>';
-      on('sync-login-btn', () => signIn((document.getElementById('sync-email') || {}).value, (document.getElementById('sync-pass') || {}).value, false));
-      on('sync-create-btn', () => signIn((document.getElementById('sync-email') || {}).value, (document.getElementById('sync-pass') || {}).value, true));
-      on('sync-pass-eye', () => { const i = document.getElementById('sync-pass'); if (i) i.type = i.type === 'password' ? 'text' : 'password'; });
-      on('sync-forget-btn', forget);
-      return;
-    }
-
-    // 3) Logado e (em geral) sincronizando
-    host.innerHTML =
-      '<div class="card card-dashboard mb-4"><div class="card-body">'
-      + '<h4 class="card-title"><i class="fas fa-cloud me-2 text-info"></i>Sincronização na nuvem (Firebase)</h4>'
-      + '<div class="d-flex justify-content-between align-items-center p-2 rounded mb-3" style="background:rgba(0,0,0,0.04);">'
-      + '<div><div style="font-size:0.7rem;color:#95a5a6;text-transform:uppercase;letter-spacing:.05em;">Status</div><div id="sync-status" style="font-weight:700;">' + esc(statusText) + '</div></div>'
-      + '<div class="text-end"><div style="font-size:0.7rem;color:#95a5a6;text-transform:uppercase;letter-spacing:.05em;">Último envio</div><div style="font-weight:600;font-size:0.85rem;">' + fmtWhen(lastPushedAt) + '</div></div>'
-      + '</div>'
-      + '<p class="text-muted mb-2" style="font-size:0.74rem;"><i class="fas fa-user me-1"></i>Conta: <code>' + esc(EMAIL || (fbUser && fbUser.email) || '') + '</code>' + (FBCONFIG && FBCONFIG.projectId ? ' &nbsp;·&nbsp; <i class="fas fa-database me-1"></i>Projeto: <code>' + esc(FBCONFIG.projectId) + '</code>' : '') + '</p>'
-      + '<button class="btn btn-info w-100 text-white" id="sync-now-btn"' + (busy ? ' disabled' : '') + '><i class="fas fa-arrows-rotate me-1"></i> Sincronizar agora</button>'
-      + '<p class="text-muted mt-3 mb-0" style="font-size:0.78rem;">Envio automático a cada alteração e baixa automática ao abrir o app. Resolução por "último a salvar vence". Ao restaurar um backup, os dados restaurados são enviados para a nuvem.</p>'
+    const where = PROVIDER === 'github'
+      ? '<i class="fab fa-github me-1"></i>Repositório: <code>' + esc(GHCFG.owner + '/' + GHCFG.repo) + '</code>'
+      : '<i class="fas fa-fire me-1"></i>Firebase: <code>' + esc((EMAIL || (fbUser && fbUser.email) || '') + ' · ' + FBCONFIG.projectId) + '</code>';
+    host.innerHTML = card(
+      '<div class="d-flex justify-content-between align-items-center p-2 rounded mb-3" style="background:rgba(0,0,0,0.04);">'
+      + '<div><div style="font-size:0.7rem;color:#95a5a6;text-transform:uppercase;letter-spacing:.05em;">Status</div><div id="sync-status" style="font-weight:700;">' + (busy ? '<i class="fas fa-spinner fa-spin me-1"></i>' : '') + esc(enabled ? statusText : 'Pausada') + '</div><div id="sync-progress" style="font-size:0.75rem;color:#7f8c8d;">' + esc(progressText) + '</div></div>'
+      + '<div class="text-end"><div style="font-size:0.7rem;color:#95a5a6;text-transform:uppercase;letter-spacing:.05em;">Última sincronização</div><div style="font-weight:600;font-size:0.85rem;">' + fmtWhen(lastSyncAt) + '</div></div></div>'
+      + '<p class="text-muted mb-2" style="font-size:0.75rem;">' + where + '</p>'
+      + '<button class="btn btn-info w-100 text-white" id="sync-now-btn"' + (busy || !enabled ? ' disabled' : '') + '><i class="fas fa-arrows-rotate me-1"></i> Sincronizar agora</button>'
+      + '<p class="text-muted mt-3 mb-0" style="font-size:0.78rem;">Envia automaticamente a cada alteração e verifica novidades ao abrir o app, ao voltar para ele e a cada minuto. Alterações em registros diferentes são mescladas; no mesmo registro vence o último a salvar.</p>'
       + '<div class="d-flex gap-2 mt-3">'
-      + '<button class="btn btn-sm btn-outline-secondary flex-fill" id="sync-pause-btn"><i class="fas fa-pause me-1"></i>' + (enabled ? 'Pausar' : 'Retomar') + '</button>'
-      + '<button class="btn btn-sm btn-outline-danger flex-fill" id="sync-forget-btn"><i class="fas fa-right-from-bracket me-1"></i>Sair / Remover</button>'
-      + '</div>'
-      + errHtml()
-      + '</div></div>';
-    on('sync-now-btn', syncNow);
-    on('sync-pause-btn', () => { if (enabled) disconnect(); else { enabled = true; cfgSet('enabled', '1'); setStatus('Sincronizado'); syncNow(); renderPanel(); } });
+      + '<button class="btn btn-sm btn-outline-secondary flex-fill" id="sync-pause-btn"><i class="fas fa-' + (enabled ? 'pause' : 'play') + ' me-1"></i>' + (enabled ? 'Pausar' : 'Retomar') + '</button>'
+      + '<button class="btn btn-sm btn-outline-danger flex-fill" id="sync-forget-btn"><i class="fas fa-right-from-bracket me-1"></i>Desconectar</button></div>'
+      + '<details class="mt-3" style="font-size:0.8rem;"><summary class="text-muted">Avançado</summary>'
+      + '<div class="d-flex flex-column gap-2 mt-2">'
+      + '<button class="btn btn-sm btn-outline-primary" id="sync-force-remote"' + (busy || !enabled ? ' disabled' : '') + '><i class="fas fa-cloud-arrow-down me-1"></i>Substituir este aparelho pela nuvem</button>'
+      + '<button class="btn btn-sm btn-outline-danger" id="sync-force-local"' + (busy || !enabled ? ' disabled' : '') + '><i class="fas fa-cloud-arrow-up me-1"></i>Substituir a nuvem por este aparelho</button>'
+      + '</div></details>'
+      + errHtml());
+    on('sync-now-btn', () => runSync('merge', { manual: true }));
+    on('sync-pause-btn', pauseToggle);
     on('sync-forget-btn', forget);
+    on('sync-force-remote', () => forceMode('remote'));
+    on('sync-force-local', () => forceMode('local'));
   }
 
   function injectUI() {
     const panel = document.getElementById('configuracoes');
     if (!panel || document.getElementById('sync-panel')) return;
     const wrap = document.createElement('div'); wrap.id = 'sync-panel';
-    panel.appendChild(wrap);
-    renderPanel();
+    panel.appendChild(wrap); renderPanel();
   }
 
-  /* ---------- Boot ---------- */
+  /* ================== Boot ================== */
   let _booting = false;
   async function tryBoot() {
     if (booted || _booting) return;
-    if (!dbReady() || !loginDone()) return;   // espera o app abrir o banco e o login concluir
+    if (!dbReady() || !loginDone()) return;
     _booting = true;
-    loadCfg();
-    injectUI();
+    loadCfg(); injectUI();
+    if (PROVIDER === 'firebase' && FBCONFIG) { try { await initFirebase(); } catch (e) { lastError = e.message || String(e); } }
+    P = makeProvider();
     booted = true;
-
-    if (FBCONFIG) {
-      try { await initFirebase(); } catch (e) { console.warn('initFirebase', e); lastError = e.message || String(e); }
-    }
-    setStatus(enabled ? (fbUser ? 'Sincronizado' : 'Aguardando login') : (FBCONFIG ? 'Pausada' : 'Não configurado'));
+    setStatus(enabled ? (P ? 'Conectando…' : 'Aguardando login') : (PROVIDER ? 'Pausada' : 'Não configurado'));
     renderPanel();
 
-    if (enabled && fbReady && fbUser) {
-      // ── CORREÇÃO DO BUG DE RESTAURAÇÃO ──
-      // Se acabamos de restaurar um backup, ENVIA os dados restaurados para a
-      // nuvem em vez de baixar (que sobrescreveria a restauração).
-      let restorePending = false;
-      try { restorePending = !!localStorage.getItem('__sync_restore_pending'); } catch (e) {}
-      if (restorePending) {
-        try { _lsRemove('__sync_restore_pending'); } catch (e) {}
-        await doPush();
-        toast('Backup restaurado e enviado para a nuvem ✅', 'success');
-      } else {
-        await doPull(false);   // baixa automática ao entrar
-      }
-    } else {
-      // Sync inativo neste aparelho: a restauração já valeu localmente, então
-      // apenas descarta o aviso para não disparar um envio antigo depois.
-      try { _lsRemove('__sync_restore_pending'); } catch (e) {}
+    let restorePending = false;
+    try { restorePending = !!localStorage.getItem('__sync_restore_pending'); } catch (e) {}
+    try { _lsRemove('__sync_restore_pending'); } catch (e) {}
+    if (enabled && P) {
+      if (restorePending) { const ok = await runSync('local', { quiet: true }); if (ok) toast('Backup restaurado e enviado para a nuvem ✅', 'success'); }
+      else await runSync('merge', { quiet: true });
     }
     _booting = false;
   }
-
   const _bootTimer = setInterval(() => { tryBoot().catch(e => console.warn('sync boot', e)); if (booted) clearInterval(_bootTimer); }, 800);
 
   document.addEventListener('visibilitychange', () => {
-    if (!enabled || !booted || !fbReady || !fbUser) return;
-    if (document.hidden) { if (dirty && !busy) doPush(); }
-    else if (!busy) doPull(false);
+    if (!enabled || !booted || !P) return;
+    if (document.hidden) { if (dirty && !busy) runSync('merge', { quiet: true }); }
+    else pollRemote();
   });
-  setInterval(() => { if (enabled && booted && fbReady && fbUser && !document.hidden && !busy && !dirty) doPull(false); }, 180000);
+  window.addEventListener('online', () => { if (enabled && booted && P) runSync('merge', { quiet: true }); });
+  window.addEventListener('beforeunload', (e) => { if (enabled && (dirty || busy)) { e.preventDefault(); e.returnValue = ''; } });
+  setInterval(pollRemote, POLL_MS);
 
+  // Exposto para depuração no console
+  window.__acadSync = { syncNow: () => runSync('merge', { manual: true }), state: () => ({ PROVIDER, enabled, busy, dirty, statusText, lastError, lastSyncAt, base: loadBase() && loadBase().rev }) };
 })();
 </script>
 
