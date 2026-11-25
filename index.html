@@ -8836,7 +8836,9 @@ Segue em anexo o trabalho "${t.titulo}", da disciplina ${nomeDisciplina}, confor
 
 Fico à disposição para quaisquer dúvidas ou esclarecimentos.
 
-Atenciosamente,`;
+Atenciosamente,${(() => {
+    try { const s = JSON.parse(localStorage.getItem('acpro_session_v1') || 'null'); return s && s.nome ? '\n' + s.nome : ''; } catch (e) { return ''; }
+})()}`;
 
         document.getElementById('emailTrabalhoAssunto').value = assunto;
         document.getElementById('emailTrabalhoMensagem').value = mensagem;
@@ -8853,30 +8855,86 @@ Atenciosamente,`;
         const existingAviso = modalEl.querySelector('.email-aviso-anexo');
         if (existingAviso) existingAviso.remove();
 
-        document.getElementById('emailTrabalhoBtnEnviar').onclick = function() {
-            const assuntoFinal = encodeURIComponent(document.getElementById('emailTrabalhoAssunto').value);
-            const bodyFinal = encodeURIComponent(document.getElementById('emailTrabalhoMensagem').value);
-            const mailtoLink = `mailto:${emailProf}?subject=${assuntoFinal}&body=${bodyFinal}`;
-            const anexoInput = document.getElementById('emailTrabalhoAnexo');
-            const temAnexo = anexoInput.files && anexoInput.files.length > 0;
+        // Lê sempre os valores ATUAIS do formulário (o usuário pode ter editado)
+        const lerCampos = () => ({
+            assunto: document.getElementById('emailTrabalhoAssunto').value || '',
+            corpo: (document.getElementById('emailTrabalhoMensagem').value || '').replace(/\r?\n/g, '\r\n'),
+            arquivo: (() => { const i = document.getElementById('emailTrabalhoAnexo'); return i.files && i.files[0] ? i.files[0] : null; })()
+        });
+        // RFC 6068: quebras de linha como %0D%0A e destinatário codificado
+        const montarMailto = (c) => 'mailto:' + encodeURIComponent(emailProf).replace(/%40/g, '@') +
+            '?subject=' + encodeURIComponent(c.assunto) + '&body=' + encodeURIComponent(c.corpo);
+        // Abre via <a> clicado de forma síncrona (mantém o "gesto do usuário" — necessário no iOS/PWA)
+        const abrirLink = (href, novaAba) => {
+            const a = document.createElement('a');
+            a.href = href;
+            if (novaAba) { a.target = '_blank'; a.rel = 'noopener'; }
+            document.body.appendChild(a); a.click(); a.remove();
+        };
+        const mostrarAviso = (html) => {
+            const old = modalEl.querySelector('.email-aviso-anexo'); if (old) old.remove();
+            const avisoDiv = document.createElement('div');
+            avisoDiv.className = 'email-aviso-anexo';
+            avisoDiv.style.cssText = 'margin-top:12px;padding:10px 14px;background:#fff3cd;border:1px solid #ffc107;border-radius:8px;font-size:0.82rem;color:#856404;';
+            avisoDiv.innerHTML = html;
+            modalEl.querySelector('.modal-body').appendChild(avisoDiv);
+        };
+        const baixarArquivo = (file) => {
+            const url = URL.createObjectURL(file);
+            const a = document.createElement('a');
+            a.href = url; a.download = file.name;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 4000);
+        };
 
-            if (temAnexo) {
-                const nomeArquivo = anexoInput.files[0].name;
-                const url = URL.createObjectURL(anexoInput.files[0]);
-                const a = document.createElement('a');
-                a.href = url; a.download = nomeArquivo; a.click();
-                setTimeout(() => URL.revokeObjectURL(url), 1000);
+        document.getElementById('emailTrabalhoBtnEnviar').onclick = async function() {
+            const c = lerCampos();
 
-                const avisoDiv = document.createElement('div');
-                avisoDiv.className = 'email-aviso-anexo';
-                avisoDiv.style.cssText = 'margin-top:12px;padding:10px 14px;background:#fff3cd;border:1px solid #ffc107;border-radius:8px;font-size:0.82rem;color:#856404;';
-                avisoDiv.innerHTML = `<i class="fas fa-download me-1"></i> O arquivo <strong>${nomeArquivo}</strong> foi baixado. Após abrir o e-mail, anexe-o manualmente.`;
-                document.querySelector('#emailTrabalhoModal .modal-body').appendChild(avisoDiv);
-                setTimeout(() => { window.location.href = mailtoLink; }, 400);
+            if (c.arquivo) {
+                // Celular: compartilhar com o arquivo JÁ anexado (Mail/Gmail/Outlook)
+                try {
+                    if (navigator.canShare && navigator.canShare({ files: [c.arquivo] })) {
+                        try { await navigator.clipboard.writeText(emailProf); } catch (e) {}
+                        await navigator.share({ files: [c.arquivo], title: c.assunto, text: c.corpo });
+                        mostrarAviso(`<i class="fas fa-info-circle me-1"></i> Se o campo "Para" ficou vazio, cole o e-mail do professor (<strong>${emailProf}</strong>) — ele foi copiado.`);
+                        return;
+                    }
+                } catch (err) {
+                    if (err && err.name === 'AbortError') return; // usuário cancelou
+                }
+                // Desktop: abre o e-mail já preenchido e baixa o arquivo para anexar manualmente
+                abrirLink(montarMailto(c));
+                baixarArquivo(c.arquivo);
+                mostrarAviso(`<i class="fas fa-download me-1"></i> O arquivo <strong>${c.arquivo.name}</strong> foi baixado. Anexe-o manualmente no e-mail que abriu.`);
             } else {
-                window.location.href = mailtoLink;
-                bootstrap.Modal.getInstance(modalEl).hide();
+                abrirLink(montarMailto(c));
+                setTimeout(() => { const inst = bootstrap.Modal.getInstance(modalEl); if (inst) inst.hide(); }, 300);
             }
+        };
+
+        // Alternativas que SEMPRE trazem os dados preenchidos (independente do app padrão)
+        document.getElementById('emailTrabalhoBtnGmail').onclick = function() {
+            const c = lerCampos();
+            abrirLink('https://mail.google.com/mail/?view=cm&fs=1&to=' + encodeURIComponent(emailProf) +
+                '&su=' + encodeURIComponent(c.assunto) + '&body=' + encodeURIComponent(c.corpo), true);
+            if (c.arquivo) { baixarArquivo(c.arquivo); mostrarAviso(`<i class="fas fa-download me-1"></i> O arquivo <strong>${c.arquivo.name}</strong> foi baixado. Anexe-o no Gmail.`); }
+        };
+        document.getElementById('emailTrabalhoBtnOutlook').onclick = function() {
+            const c = lerCampos();
+            abrirLink('https://outlook.office.com/mail/deeplink/compose?to=' + encodeURIComponent(emailProf) +
+                '&subject=' + encodeURIComponent(c.assunto) + '&body=' + encodeURIComponent(c.corpo), true);
+            if (c.arquivo) { baixarArquivo(c.arquivo); mostrarAviso(`<i class="fas fa-download me-1"></i> O arquivo <strong>${c.arquivo.name}</strong> foi baixado. Anexe-o no Outlook.`); }
+        };
+        document.getElementById('emailTrabalhoBtnCopiar').onclick = async function() {
+            const c = lerCampos();
+            const texto = `Para: ${emailProf}\nAssunto: ${c.assunto}\n\n${c.corpo.replace(/\r\n/g, '\n')}`;
+            try {
+                await navigator.clipboard.writeText(texto);
+            } catch (e) {
+                const ta = document.createElement('textarea'); ta.value = texto; document.body.appendChild(ta); ta.select();
+                try { document.execCommand('copy'); } catch (_) {} ta.remove();
+            }
+            mostrarAviso('<i class="fas fa-check me-1"></i> Destinatário, assunto e mensagem copiados. Cole no seu app de e-mail.');
         };
 
         bootstrap.Modal.getOrCreateInstance(modalEl).show();
@@ -21628,11 +21686,16 @@ function _renderScore() {
         <div class="mb-1">
           <label class="form-label fw-semibold" style="font-size:0.85rem;"><i class="fas fa-paperclip me-1 text-secondary"></i>Anexar arquivo do trabalho</label>
           <input type="file" class="form-control" id="emailTrabalhoAnexo" accept=".pdf,.docx,.pptx,.doc,.txt,image/*" style="border-radius:8px;font-size:0.85rem;">
-          <div style="font-size:0.73rem;color:#95a5a6;margin-top:5px;"><i class="fas fa-exclamation-circle me-1"></i>O arquivo será aberto no seu app de e-mail para ser enviado.</div>
+          <div style="font-size:0.73rem;color:#95a5a6;margin-top:5px;"><i class="fas fa-exclamation-circle me-1"></i>No celular, o arquivo já vai anexado pelo menu de compartilhar. No computador, ele é baixado para você anexar.</div>
         </div>
 
       </div>
-      <div class="modal-footer" style="padding:14px 24px;border-top:1px solid #f0f2f4;gap:10px;">
+      <div class="modal-footer" style="padding:14px 24px;border-top:1px solid #f0f2f4;gap:8px;flex-wrap:wrap;">
+        <div style="width:100%;font-size:0.73rem;color:#95a5a6;margin-bottom:2px;">Se o app de e-mail abrir vazio, use uma das opções abaixo:</div>
+        <button class="btn btn-outline-danger btn-sm" id="emailTrabalhoBtnGmail" style="border-radius:8px;font-size:0.8rem;"><i class="fab fa-google me-1"></i>Gmail</button>
+        <button class="btn btn-outline-primary btn-sm" id="emailTrabalhoBtnOutlook" style="border-radius:8px;font-size:0.8rem;"><i class="fab fa-microsoft me-1"></i>Outlook</button>
+        <button class="btn btn-outline-secondary btn-sm" id="emailTrabalhoBtnCopiar" style="border-radius:8px;font-size:0.8rem;"><i class="fas fa-copy me-1"></i>Copiar</button>
+        <div class="flex-grow-1"></div>
         <button class="btn btn-outline-secondary" data-bs-dismiss="modal" style="border-radius:8px;font-size:0.85rem;">Cancelar</button>
         <button class="btn" id="emailTrabalhoBtnEnviar" style="background:linear-gradient(135deg,#3498db,#2980b9);color:white;border-radius:8px;font-size:0.85rem;font-weight:600;padding:8px 22px;">
           <i class="fas fa-paper-plane me-2"></i>Abrir no App de E-mail
